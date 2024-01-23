@@ -237,7 +237,7 @@ void rec(String &s, const char *dir)
       // 00000 TX content... \n
       if (new_file.printf("%lu\t%s\t%s\n", millis(), dir, s.c_str()))
       {
-        log_i("rec %s: %s", dir, s.c_str());
+        log_d("rec %s: %s", dir, s.c_str());
       }
       else
       {
