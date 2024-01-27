@@ -124,7 +124,7 @@ public:
 
             cfg.pin_bl = PIN_LCD_BLK;      // バックライトが接続されているピン番号
             cfg.invert = false;  // バックライトの輝度を反転させる場合 true
-            cfg.freq = 5000;     // バックライトのPWM周波数
+            cfg.freq = 500;     // バックライトのPWM周波数
             cfg.pwm_channel = 1; // 使用するPWMのチャンネル番号
 
             _light_instance.config(cfg);
