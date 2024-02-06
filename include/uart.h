@@ -7,18 +7,18 @@
 #include "bandrate.h"
 #include "sdcard.h"
 
-#define UART_TIMEOUT 200 // DO NOT SET THIS ABOVE 800 (DAFAULT WATCHDOG: 300/800)
-#define UART_QUEUE_WAIT_MS 100
-#define UART_TASKDELAY 20 // up to 50 lines/s
+#define UART_TIMEOUT 50 // DO NOT SET THIS ABOVE 800 (DAFAULT WATCHDOG: 300/800)
+#define UART_WAIT 10 // wait for buffer prepared
 
 typedef struct queue_t
 {
-    String data_string;
+    char data_char[128]; // UART buffer: 120b
+    uint8_t data_len;
     bool is_rx;
 } uart_data_t;
 
 extern QueueHandle_t uart_queue;
-extern bool is_queue_ok;
+extern bool is_pause;
 void uart_change_bandrate(uint32_t bandrate);
 void uart_init(void);
 

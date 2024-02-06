@@ -1,60 +1,47 @@
 #include "uart.h"
+#include "ui.h"
+#include "HardwareSerial.h"
 
 QueueHandle_t uart_queue;
-bool is_queue_ok;
+bool is_pause;
 
-static void task_uart(void *pvParameters)
+void onReceive_cb(HardwareSerial &selected_serial)
 {
     uart_data_t q;
-    String input;
-    while (1)
+    size_t available = selected_serial.available();
+    for (int i = 0; i < available; ++i)
     {
-        if (Serial1.available() > 0)
-        {
-            input = Serial1.readStringUntil('\n');
-            input.trim();
-            q.data_string = input.substring(0, 1024);
-            q.is_rx = true;
-            if (is_queue_ok)
-                // xQueueSend(uart_queue, &q, UART_QUEUE_WAIT_MS/portTICK_PERIOD_MS);
-                xQueueSend(uart_queue, &q, 0);
-            rec(q.data_string, "RX");
-        }
-        if (Serial2.available() > 0)
-        {
-            input = Serial2.readStringUntil('\n');
-            input.trim();
-            q.data_string = input.substring(0, 128);
-            q.is_rx = false;
-            if (is_queue_ok)
-                // xQueueSend(uart_queue, &q, UART_QUEUE_WAIT_MS/portTICK_PERIOD_MS);
-                xQueueSend(uart_queue, &q, 0);
-            rec(q.data_string, "TX");
-        }
-        vTaskDelay(UART_TASKDELAY);
+        q.data_char[i] = selected_serial.read();
     }
+    q.data_char[available] = 0; // Add the terminating nul char
+    q.data_len = available;
+    q.is_rx = &selected_serial == &Serial1 ? true : false;
+    if (!is_mode_changing)
+        xQueueSend(uart_queue, (void *)&q, 0); // do not block this task
 }
 
 void uart_change_bandrate(uint32_t bandrate)
 {
     Serial1.flush();
-    delay(UART_TASKDELAY);
+    delay(UART_WAIT);
     Serial2.flush();
-    delay(UART_TASKDELAY);
+    delay(UART_WAIT);
     Serial1.updateBaudRate(bandrate);
-    delay(UART_TASKDELAY);
+    delay(UART_WAIT);
     Serial2.updateBaudRate(bandrate);
-    delay(UART_TASKDELAY);
+    delay(UART_WAIT);
     log_i("bandrate updated to: %d", bandrate);
 }
 
 void uart_init(void)
 {
-    uart_queue = xQueueCreate(80, sizeof(uart_data_t));
+    uart_queue = xQueueCreate(200, sizeof(uart_data_t));
     Serial1.setTimeout(UART_TIMEOUT);
     Serial2.setTimeout(UART_TIMEOUT);
+    Serial1.onReceive([]()
+                      { onReceive_cb(Serial1); });
+    Serial2.onReceive([]()
+                      { onReceive_cb(Serial2); });
     Serial1.begin(bandrate_list[bandrate_index], SERIAL_8N1, PIN_RX, -1, false, UART_TIMEOUT);
     Serial2.begin(bandrate_list[bandrate_index], SERIAL_8N1, PIN_TX, -1, false, UART_TIMEOUT);
-    xTaskCreatePinnedToCore(task_uart, "task_uart", 32768, NULL, 7, NULL, 0);
-    is_queue_ok = true;
 }
