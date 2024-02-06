@@ -27,10 +27,8 @@
 #define COLOR_INFO_BG COLOR_SHADOW
 #define COLOR_INFO_SHADOW COLOR_SHADOW
 // txt terminal
-#define COLOR_TERM_RECENT_RX_TEXT COLOR_HIGHLIGHT
-#define COLOR_TERM_RX_TEXT 0xafb1ac
-#define COLOR_TERM_RECENT_TX_TEXT 0xf5bd34
-#define COLOR_TERM_TX_TEXT 0xad8428
+#define COLOR_TERM_RX_TEXT COLOR_HIGHLIGHT
+#define COLOR_TERM_TX_TEXT 0xf5bd34
 // chart default values
 #define COLOR_CHART_PALETTE {0xe83a37, 0xf5bd34, 0x6ebe77, 0x3697d4, 0xdc4894}
 #define COLOR_CHART_BG 0x004e84
@@ -43,13 +41,14 @@
 
 #define SCREEN_WIDTH 320
 #define SCREEN_HEIGHT 240
-#define TERM_LIME_MAX 40
+#define TERM_ROW_MAX_NUM 40
+#define TERM_LINE_MAX_LENGTH 352
 #define CHART_WIDTH_PIXEL 274
 #define CHART_RESET_AT_IDLE_LOOP 3
 #define CHART_VALUE_SCALE_DEFAULT 100 // avoid float in chart data: 0.01*100 -> 1
 #define CHART_VALUE_FMT_DEFAULT "%.1f"
 #define CHART_COUNT_MAX 5 // no more screen space for more than 5 charts
-#define UI_REFRESH_DELAY 20 // up to 50 lines/s
+#define UI_REFRESH_DELAY 15 // 50+ fps
 #define BACKLIGHT_PWM_TOLERANCE 20 // do not change backlight pwm within +-N
 
 #define ENV_LIGHT_PWM_MIN 85
@@ -137,7 +136,7 @@ public:
 };
 
 extern SemaphoreHandle_t lvgl_mutex;
-extern bool toggle_chart_terminal;
+extern bool is_mode_changing;
 
 void ui_init(void);
 

@@ -53,7 +53,7 @@ static String batt_status_symbol[5] = {LV_SYMBOL_BATTERY_FULL, LV_SYMBOL_BATTERY
 static uint8_t batt_status;
 static uint8_t ui_batt_status;
 static bool line_exceeded;
-bool toggle_chart_terminal;
+bool is_mode_changing;
 
 // fonts
 LV_FONT_DECLARE(ui_font_SFMono_14);
@@ -375,10 +375,69 @@ static void ui_task_update_topbar(void *pvParameters)
     vTaskDelete(NULL);
 }
 
+static void ui_term_new_line(bool is_rx)
+{
+    // remove old lines
+    if (line_exceeded)
+    {
+        lv_obj_del(lv_obj_get_child(ui_panList, 0));
+    }
+    else
+    {
+        if (lv_obj_get_child_cnt(ui_panList) >= TERM_ROW_MAX_NUM)
+        {
+            line_exceeded = true;
+        }
+    }
+
+    // add one new line
+    currentLine = lv_label_create(ui_panList);
+    lv_obj_set_width(currentLine, lv_pct(100));
+    lv_obj_set_height(currentLine, LV_SIZE_CONTENT); /// 1
+    lv_obj_set_align(currentLine, LV_ALIGN_CENTER);
+    lv_obj_set_style_text_font(currentLine, &ui_font_SFMono_14, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_top(currentLine, -2, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_bottom(currentLine, -1, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_clear_flag(currentLine, LV_OBJ_FLAG_PRESS_LOCK | LV_OBJ_FLAG_CLICK_FOCUSABLE | LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_SNAPPABLE | LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_CHAIN); /// Flags
+    lv_label_set_text(currentLine, "");
+    if (is_rx)
+    {
+        lv_obj_set_style_text_color(currentLine, lv_color_hex(COLOR_TERM_RX_TEXT), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_align(currentLine, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN | LV_STATE_DEFAULT);
+    }
+    else
+    {
+        lv_obj_set_style_text_color(currentLine, lv_color_hex(COLOR_TERM_TX_TEXT), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_align(currentLine, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN | LV_STATE_DEFAULT);
+    }
+
+    // update line number
+    lineCount++;
+    lv_label_set_text_fmt(ui_lblLineCounter, "%u", lineCount);
+}
+
+static void ui_star_shoot(bool is_rx, char *data)
+{
+    if (is_rx)
+    {
+        trigger_star_rx((~crc32_le((uint32_t) ~(0xffffffff), (const uint8_t *)data, strlen(data))) ^ 0xffffffff);
+    }
+    else
+    {
+        trigger_star_tx((~crc32_le((uint32_t) ~(0xffffffff), (const uint8_t *)data, strlen(data))) ^ 0xffffffff);
+    }
+}
+
 static void ui_task_update_main_screen(void *pvParameters)
 {
     // common
     uart_data_t q;
+    bool is_new_data;
+    bool is_new_line;
+    bool is_end_with_new_line;
+    uint16_t pos_start;
+    String current_str;
+    bool cuurent_is_rx;
 
     // chart
     lv_point_t p;
@@ -388,211 +447,235 @@ static void ui_task_update_main_screen(void *pvParameters)
 
     for (;;)
     {
-        if (xQueueReceive(uart_queue, &q, 0) == pdTRUE && toggle_chart_terminal == false)
+        // wait for changing mode
+        if (is_mode_changing)
         {
-            if (pdTRUE == xSemaphoreTake(lvgl_mutex, portMAX_DELAY))
+            vTaskDelay(UI_REFRESH_DELAY);
+        }
+        else
+        {
+            // check xQueue
+            if (pdPASS == xQueueReceive(uart_queue, &q, 0))
             {
-                lineCount++;
-                lv_label_set_text_fmt(ui_lblLineCounter, "%u", lineCount);
-                if (q.is_rx)
-                {
-                    // calc hash for strips color
-                    trigger_star_rx((~crc32_le((uint32_t) ~(0xffffffff), (const uint8_t *)q.data_string.c_str(), q.data_string.length())) ^ 0xffffffff);
-                }
-                else
-                {
-                    // calc hash for strips color
-                    trigger_star_tx((~crc32_le((uint32_t) ~(0xffffffff), (const uint8_t *)q.data_string.c_str(), q.data_string.length())) ^ 0xffffffff);
-                }
+                is_new_data = true;
+                rec(q.is_rx, q.data_char);
 
-                // check if config line: start with {"config" or {'config'
-                if (strcmp(q.data_string.substring(2, 8).c_str(), "config") == 0)
+                if (pdTRUE == xSemaphoreTake(lvgl_mutex, portMAX_DELAY))
                 {
-                    ui_update_chart_config(q.data_string);
-                }
-                else
-                {
-                    if (is_chart)
+                    // header and footer of data_char check
+                    if (q.data_char[0] == 10 || q.data_char[0] == 13)
                     {
-                        // chart mode
-                        JsonDocument doc; // do not reuse this doc, it will cause memory leak
-                        DeserializationError error = deserializeJson(doc, q.data_string);
+                        log_d("start with r/n");
+                        is_new_line = true;
+                    }
+                    if (q.data_char[q.data_len - 1] == 10 || q.data_char[q.data_len - 1] == 13)
+                    {
+                        log_d("end with r/n");
+                        is_end_with_new_line = true;
+                    }
+                    else
+                    {
+                        is_end_with_new_line = false;
+                    }
 
-                        // attention: only JsonObject would be accepted
-                        // {"a":123} ok
-                        // [123,123] skip
-
-                        if (error || !doc.is<JsonObject>())
+                    // check format: x x x \r \n x x x ...
+                    char *pch;
+                    pch = strtok(q.data_char, "\r\n");
+                    while (pch != NULL)
+                    {
+                        if (is_new_line)
                         {
-                            lv_label_set_text(ui_lblQString, q.data_string.c_str());
-                            if (!ui_panWaiting_is_visible)
+                            current_str = pch;
+
+                            // check if chart-config line: start with {"config" or {'config'
+                            if (strcmp(current_str.substring(2, 8).c_str(), "config") == 0)
                             {
-                                lv_obj_fade_in(ui_panWaiting, 100, 0);
-                                ui_panWaiting_is_visible = true;
+                                ui_update_chart_config(current_str);
                             }
-                        }
-                        else
-                        {
-                            if (is_prepare_sername_needed)
-                            {
-                                if (chart_series_prop.is_set_by_config)
-                                {
-                                    // chart ser name was set by config json
-                                    for (size_t i = 0; i < CHART_COUNT_MAX; i++)
-                                    {
-                                        if (i >= chart_series_prop.series_count)
-                                        {
-                                            // these series will be hidden
-                                            lv_obj_add_flag(ui_group_legend_pan[i], LV_OBJ_FLAG_HIDDEN);
-                                            log_i("mark hide chart_series_names: %u", i);
-                                        }
-                                        else
-                                        {
-                                            // reset legend
-                                            lv_obj_clear_flag(ui_group_legend_pan[i], LV_OBJ_FLAG_HIDDEN);
-                                            lv_label_set_text(ui_group_legend_cap[i], chart_series_prop.sername[i].c_str());
-                                            lv_obj_set_width(ui_group_legend_pan[i], lv_pct(100 / chart_series_prop.series_count));
 
-                                            log_i("reset chart_series_names_by_config: %u/%u - %s", i, chart_series_prop.series_count, chart_series_prop.sername[i]);
-                                        }
+                            // update ui
+                            if (is_chart)
+                            {
+                                // update line number
+                                lineCount++;
+                                lv_label_set_text_fmt(ui_lblLineCounter, "%u", lineCount);
+                                ui_star_shoot(q.is_rx, pch);
+
+                                JsonDocument doc; // do not reuse this doc, it will cause memory leak
+                                DeserializationError error = deserializeJson(doc, pch);
+
+                                // attention: only JsonObject would be accepted
+                                // {"a":123} ok
+                                // [123,123] skip
+
+                                if (error || !doc.is<JsonObject>())
+                                {
+                                    lv_label_set_text(ui_lblQString, pch);
+                                    if (!ui_panWaiting_is_visible)
+                                    {
+                                        lv_obj_fade_in(ui_panWaiting, 100, 0);
+                                        ui_panWaiting_is_visible = true;
                                     }
                                 }
                                 else
                                 {
-                                    // Chart will be set by the first line of JSON if no config info received
-                                    // make sure series count is under CHART_COUNT_MAX
-                                    chart_series_prop.series_count = doc.size() >= CHART_COUNT_MAX ? CHART_COUNT_MAX : doc.size();
-
-                                    JsonObject::iterator it = doc.as<JsonObject>().begin();
-                                    for (size_t i = 0; i < CHART_COUNT_MAX; i++)
+                                    if (is_prepare_sername_needed)
                                     {
-                                        if (i >= chart_series_prop.series_count)
+                                        if (chart_series_prop.is_set_by_config)
                                         {
-                                            // these series will be hidden
-                                            lv_obj_add_flag(ui_group_legend_pan[i], LV_OBJ_FLAG_HIDDEN);
-                                            log_i("mark hide chart_series_names: %u", i);
+                                            // chart ser name was set by config json
+                                            for (size_t i = 0; i < CHART_COUNT_MAX; i++)
+                                            {
+                                                if (i >= chart_series_prop.series_count)
+                                                {
+                                                    // these series will be hidden
+                                                    lv_obj_add_flag(ui_group_legend_pan[i], LV_OBJ_FLAG_HIDDEN);
+                                                    log_i("mark hide chart_series_names: %u", i);
+                                                }
+                                                else
+                                                {
+                                                    // reset legend
+                                                    lv_obj_clear_flag(ui_group_legend_pan[i], LV_OBJ_FLAG_HIDDEN);
+                                                    lv_label_set_text(ui_group_legend_cap[i], chart_series_prop.sername[i].c_str());
+                                                    lv_obj_set_width(ui_group_legend_pan[i], lv_pct(100 / chart_series_prop.series_count));
+
+                                                    log_i("reset chart_series_names_by_config: %u/%u - %s", i, chart_series_prop.series_count, chart_series_prop.sername[i]);
+                                                }
+                                            }
                                         }
                                         else
                                         {
-                                            chart_series_prop.sername[i] = it->key().c_str(); // copy the content
+                                            // Chart will be set by the first line of JSON if no config info received
+                                            // make sure series count is under CHART_COUNT_MAX
+                                            chart_series_prop.series_count = doc.size() >= CHART_COUNT_MAX ? CHART_COUNT_MAX : doc.size();
 
-                                            // reset legend
-                                            lv_obj_clear_flag(ui_group_legend_pan[i], LV_OBJ_FLAG_HIDDEN);
-                                            lv_label_set_text(ui_group_legend_cap[i], chart_series_prop.sername[i].c_str());
-                                            lv_obj_set_width(ui_group_legend_pan[i], lv_pct(100 / chart_series_prop.series_count));
+                                            JsonObject::iterator it = doc.as<JsonObject>().begin();
+                                            for (size_t i = 0; i < CHART_COUNT_MAX; i++)
+                                            {
+                                                if (i >= chart_series_prop.series_count)
+                                                {
+                                                    // these series will be hidden
+                                                    lv_obj_add_flag(ui_group_legend_pan[i], LV_OBJ_FLAG_HIDDEN);
+                                                    log_i("mark hide chart_series_names: %u", i);
+                                                }
+                                                else
+                                                {
+                                                    chart_series_prop.sername[i] = it->key().c_str(); // copy the content
 
-                                            log_i("reset chart_series_names: %u/%u - %s", i, chart_series_prop.series_count, chart_series_prop.sername[i]);
-                                            it.operator++();
+                                                    // reset legend
+                                                    lv_obj_clear_flag(ui_group_legend_pan[i], LV_OBJ_FLAG_HIDDEN);
+                                                    lv_label_set_text(ui_group_legend_cap[i], chart_series_prop.sername[i].c_str());
+                                                    lv_obj_set_width(ui_group_legend_pan[i], lv_pct(100 / chart_series_prop.series_count));
+
+                                                    log_i("reset chart_series_names: %u/%u - %s", i, chart_series_prop.series_count, chart_series_prop.sername[i]);
+                                                    it.operator++();
+                                                }
+                                            }
+
+                                            // reset chart range/scale
+                                            // for (size_t i = 0; i < CHART_COUNT_MAX; i++)
+                                            // {
+                                            //     chart_ranges[i].is_initialized = false;
+                                            // }
+                                        }
+
+                                        log_i("chart_series_names inited, count:%d", chart_series_prop.series_count);
+                                        is_prepare_sername_needed = false;
+                                    }
+
+                                    // update chart
+                                    for (size_t i = 0; i < chart_series_prop.series_count; i++)
+                                    {
+                                        raw_value = doc[chart_series_prop.sername[i]].as<float>();
+                                        point_value = raw_value * chart_ranges[i].value_scale;
+                                        ui_update_chart_range(ui_group_chart[i], &chart_ranges[i], point_value);
+                                        lv_chart_set_next_value(ui_group_chart[i], ui_group_chart_series[i], point_value);
+                                        lv_label_set_text_fmt(ui_group_legend_val[i], chart_series_prop.value_fmt[i].c_str(), raw_value);
+                                    }
+
+                                    // update the indicator line
+                                    lv_chart_get_point_pos_by_id(ui_group_chart[0], ui_group_chart_series[0], chart_ser_index, &p);
+                                    lv_obj_set_x(ui_cursorV, p.x + 14);
+                                    chart_ser_index++;
+                                    if (chart_ser_index >= chart_point_count)
+                                    {
+                                        chart_ser_index = 0;
+                                    }
+                                    else
+                                    {
+                                        for (size_t i = 0; i < chart_series_prop.series_count; i++)
+                                        {
+                                            lv_chart_set_value_by_id(ui_group_chart[i], ui_group_chart_series[i], chart_ser_index, LV_CHART_POINT_NONE);
                                         }
                                     }
 
-                                    // reset chart range/scale
-                                    // for (size_t i = 0; i < CHART_COUNT_MAX; i++)
-                                    // {
-                                    //     chart_ranges[i].is_initialized = false;
-                                    // }
+                                    // display the legend
+                                    if (ui_panWaiting_is_visible)
+                                    {
+                                        lv_obj_fade_out(ui_panWaiting, 200, 0);
+                                        ui_panWaiting_is_visible = false;
+                                    }
                                 }
-
-                                log_i("chart_series_names inited, count:%d", chart_series_prop.series_count);
-                                is_prepare_sername_needed = false;
-                            }
-
-                            // update chart
-                            for (size_t i = 0; i < chart_series_prop.series_count; i++)
-                            {
-                                raw_value = doc[chart_series_prop.sername[i]].as<float>();
-                                point_value = raw_value * chart_ranges[i].value_scale;
-                                ui_update_chart_range(ui_group_chart[i], &chart_ranges[i], point_value);
-                                lv_chart_set_next_value(ui_group_chart[i], ui_group_chart_series[i], point_value);
-                                lv_label_set_text_fmt(ui_group_legend_val[i], chart_series_prop.value_fmt[i].c_str(), raw_value);
-                            }
-
-                            // update the indicator line
-                            lv_chart_get_point_pos_by_id(ui_group_chart[0], ui_group_chart_series[0], chart_ser_index, &p);
-                            lv_obj_set_x(ui_cursorV, p.x + 14);
-                            chart_ser_index++;
-                            if (chart_ser_index >= chart_point_count)
-                            {
-                                chart_ser_index = 0;
                             }
                             else
                             {
-                                for (size_t i = 0; i < chart_series_prop.series_count; i++)
+                                ui_term_new_line(q.is_rx);
+                                ui_star_shoot(q.is_rx, pch);
+                                lv_label_set_text(currentLine, pch);
+                            }
+                        }
+                        else
+                        {
+                            ui_star_shoot(q.is_rx, pch);
+                            if (is_chart)
+                            {
+                                lv_label_set_text(ui_lblQString, pch);
+                            }
+                            else
+                            {
+                                if (strlen(current_str.c_str()) < TERM_LINE_MAX_LENGTH)
                                 {
-                                    lv_chart_set_value_by_id(ui_group_chart[i], ui_group_chart_series[i], chart_ser_index, LV_CHART_POINT_NONE);
+                                    current_str += pch;
                                 }
-                            }
-
-                            // display the legend
-                            if (ui_panWaiting_is_visible)
-                            {
-                                lv_obj_fade_out(ui_panWaiting, 200, 0);
-                                ui_panWaiting_is_visible = false;
+                                else
+                                {
+                                    ui_term_new_line(q.is_rx);
+                                    current_str = pch;
+                                }
+                                lv_label_set_text(currentLine, current_str.c_str());
                             }
                         }
+
+                        pch = strtok(NULL, "\r\n");
+                        is_new_line = true;
                     }
-                    else
+                    is_new_line = is_end_with_new_line;
+                    xSemaphoreGive(lvgl_mutex);
+                }
+            }
+            else
+            {
+                if (is_new_data)
+                {
+                    if (pdTRUE == xSemaphoreTake(lvgl_mutex, portMAX_DELAY))
                     {
-                        // txt terminal mode
-                        // remove old lines
-                        if (line_exceeded)
-                        {
-                            lv_obj_del(lv_obj_get_child(ui_panList, 0));
-                        }
-                        else
-                        {
-                            if (lv_obj_get_child_cnt(ui_panList) >= TERM_LIME_MAX)
-                            {
-                                line_exceeded = true;
-                            }
-                        }
-                        is_rx_current = q.is_rx;
-                        if (is_rx_last)
-                        {
-                            lv_obj_set_style_text_color(currentLine, lv_color_hex(COLOR_TERM_RX_TEXT), LV_PART_MAIN | LV_STATE_DEFAULT);
-                        }
-                        else
-                        {
-                            lv_obj_set_style_text_color(currentLine, lv_color_hex(COLOR_TERM_TX_TEXT), LV_PART_MAIN | LV_STATE_DEFAULT);
-                        }
-                        is_rx_last = is_rx_current;
-
-                        // add one new line
-                        currentLine = lv_label_create(ui_panList);
-                        lv_obj_set_width(currentLine, lv_pct(100));
-                        lv_obj_set_height(currentLine, LV_SIZE_CONTENT); /// 1
-                        lv_obj_set_align(currentLine, LV_ALIGN_CENTER);
-                        lv_obj_set_style_text_font(currentLine, &ui_font_SFMono_14, LV_PART_MAIN | LV_STATE_DEFAULT);
-                        lv_obj_set_style_pad_top(currentLine, -2, LV_PART_MAIN | LV_STATE_DEFAULT);
-                        lv_obj_set_style_pad_bottom(currentLine, -1, LV_PART_MAIN | LV_STATE_DEFAULT);
-                        lv_obj_clear_flag(currentLine, LV_OBJ_FLAG_PRESS_LOCK | LV_OBJ_FLAG_CLICK_FOCUSABLE | LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_SNAPPABLE | LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_CHAIN); /// Flags
-                        if (is_rx_current)
-                        {
-                            lv_obj_set_style_text_color(currentLine, lv_color_hex(COLOR_TERM_RECENT_RX_TEXT), LV_PART_MAIN | LV_STATE_DEFAULT);
-                            lv_obj_set_style_text_align(currentLine, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN | LV_STATE_DEFAULT);
-                        }
-                        else
-                        {
-                            lv_obj_set_style_text_color(currentLine, lv_color_hex(COLOR_TERM_RECENT_TX_TEXT), LV_PART_MAIN | LV_STATE_DEFAULT);
-                            lv_obj_set_style_text_align(currentLine, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN | LV_STATE_DEFAULT);
-                        }
-                        lv_label_set_text(currentLine, q.data_string.c_str());
-
+                        // scroll to the bottom directly
                         if (panList_scroll_to_view)
                         {
+                            log_d("new data scroll to see it");
                             lv_obj_scroll_to_view(currentLine, LV_ANIM_OFF);
                         }
+                        is_new_data = false;
+                        xSemaphoreGive(lvgl_mutex);
                     }
                 }
-                xSemaphoreGive(lvgl_mutex);
+                vTaskDelay(UI_REFRESH_DELAY);
             }
         }
-        vTaskDelay(UI_REFRESH_DELAY);
     }
-    vTaskDelete(NULL);
 }
 
-static void ui_add_new_line_test_mode(const char *s)
+static void ui_term_new_line_test_mode(const char *s)
 {
     // remove old lines
     if (line_exceeded)
@@ -601,7 +684,7 @@ static void ui_add_new_line_test_mode(const char *s)
     }
     else
     {
-        if (lv_obj_get_child_cnt(ui_panList) >= TERM_LIME_MAX)
+        if (lv_obj_get_child_cnt(ui_panList) >= TERM_ROW_MAX_NUM)
         {
             line_exceeded = true;
         }
@@ -641,21 +724,21 @@ static void ui_task_update_main_screen_test_mode(void *pvParameters)
             {
                 char s[20];
                 sprintf(s, "EncoderR: %ld", hw_enc_bandrate.readEncoder());
-                ui_add_new_line_test_mode(s);
+                ui_term_new_line_test_mode(s);
             }
             if (hw_enc_lcd.encoderChanged())
             {
                 char s[20];
                 sprintf(s, "EncoderL: %ld", hw_enc_lcd.readEncoder());
-                ui_add_new_line_test_mode(s);
+                ui_term_new_line_test_mode(s);
             }
             if (hw_enc_bandrate.isEncoderButtonDown())
             {
-                ui_add_new_line_test_mode("EncoderR: button down");
+                ui_term_new_line_test_mode("EncoderR: button down");
             }
             if (hw_enc_lcd.isEncoderButtonDown())
             {
-                ui_add_new_line_test_mode("EncoderL: button down");
+                ui_term_new_line_test_mode("EncoderL: button down");
             }
 
             // mon
@@ -663,14 +746,14 @@ static void ui_task_update_main_screen_test_mode(void *pvParameters)
             {
                 char s[50];
                 sprintf(s, "ADC: L%04u, B%.3fV; 5V/CHG: %d|%d", mon_adc_light, mon_battery_votage, mon_is_5v_in, !mon_is_charging_idle);
-                ui_add_new_line_test_mode(s);
+                ui_term_new_line_test_mode(s);
                 last_mon = millis();
             }
 
             // uart
             if (xQueueReceive(uart_queue, &q, 0) == pdTRUE)
             {
-                ui_add_new_line_test_mode(q.data_string.c_str());
+                ui_term_new_line_test_mode(q.data_char);
             }
 
             xSemaphoreGive(lvgl_mutex);
@@ -691,9 +774,8 @@ static void ui_task_toggle_chart_terminal(void *pvParameters)
     {
         for (;;)
         {
-            if (toggle_chart_terminal)
+            if (is_mode_changing)
             {
-                is_queue_ok = false;
                 if (pdTRUE == xSemaphoreTake(lvgl_mutex, portMAX_DELAY))
                 {
 
@@ -730,8 +812,7 @@ static void ui_task_toggle_chart_terminal(void *pvParameters)
 
                     xSemaphoreGive(lvgl_mutex);
                 }
-                toggle_chart_terminal = false;
-                is_queue_ok = true;
+                is_mode_changing = false;
             }
             vTaskDelay(100);
         }
@@ -851,7 +932,7 @@ static void lv_task_timer(void *pvParameters)
             lv_timer_handler();
             xSemaphoreGive(lvgl_mutex);
         }
-        vTaskDelay(5);
+        vTaskDelay(UI_REFRESH_DELAY);
     }
     vTaskDelete(NULL);
 }
@@ -860,7 +941,7 @@ static void hw_task_backlight(void *pvParameters)
 {
     for (;;)
     {
-        if (toggle_chart_terminal == false)
+        if (is_mode_changing == false)
         {
             pwm_light = map(mon_adc_light, 0, 4096, ENV_LIGHT_PWM_MIN, ENV_LIGHT_PWM_MAX);
             if (pwm_light > pwm_light_pre + BACKLIGHT_PWM_TOLERANCE)
@@ -900,7 +981,7 @@ static void ui_draw_main_screen(void)
     LV_IMG_DECLARE(ui_img_division_y_png); // assets/division_y.png
     LV_IMG_DECLARE(ui_img_axis_y_png);     // assets/axis_y.png
     LV_IMG_DECLARE(ui_img_cursor_png);     // assets/cursor.png
-    LV_IMG_DECLARE(ui_img_splash_png);     // assets/splash.png
+    LV_IMG_DECLARE(ui_img_splash_png_se);  // assets/splash.png
 
     // draw screen
     ui_scrMain = lv_obj_create(NULL);
@@ -927,7 +1008,7 @@ static void ui_draw_main_screen(void)
     lv_obj_clear_flag(ui_panContainerTxt, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_CHAIN); /// Flags
 
     ui_imgSplash = lv_img_create(ui_panContainerTxt);
-    lv_img_set_src(ui_imgSplash, &ui_img_splash_png);
+    lv_img_set_src(ui_imgSplash, &ui_img_splash_png_se);
     lv_obj_set_x(ui_imgSplash, 0);
     lv_obj_set_y(ui_imgSplash, -13);
     lv_obj_set_align(ui_imgSplash, LV_ALIGN_CENTER);
@@ -960,7 +1041,15 @@ static void ui_draw_main_screen(void)
     lv_obj_add_style(ui_panList, &style_scrollbar, LV_PART_SCROLLBAR);
 
     currentLine = lv_label_create(ui_panList);
+    lv_obj_set_width(currentLine, lv_pct(100));
+    lv_obj_set_height(currentLine, LV_SIZE_CONTENT); /// 1
+    lv_obj_set_align(currentLine, LV_ALIGN_CENTER);
+    lv_obj_set_style_text_font(currentLine, &ui_font_SFMono_14, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_top(currentLine, -2, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_bottom(currentLine, -1, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_clear_flag(currentLine, LV_OBJ_FLAG_PRESS_LOCK | LV_OBJ_FLAG_CLICK_FOCUSABLE | LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_SNAPPABLE | LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_CHAIN); /// Flags
     lv_label_set_text(currentLine, "");
+    lv_obj_set_style_text_color(currentLine, lv_color_hex(COLOR_TERM_RX_TEXT), LV_PART_MAIN | LV_STATE_DEFAULT);
 
     // top info bar --------------------------------
     ui_panInfo = lv_obj_create(ui_scrMain);
@@ -1472,7 +1561,7 @@ static void ui_init_remove_elements_ani(void *pvParameters)
 {
     for (;;)
     {
-        if (lineCount > 1)
+        if (lineCount > 0)
         {
             lv_obj_del(ui_imgSplash);
             vTaskDelay(100);
