@@ -18,7 +18,6 @@ typedef struct queue_t
 } uart_data_t;
 
 extern QueueHandle_t uart_queue;
-extern bool is_pause;
 void uart_change_bandrate(uint32_t bandrate);
 void uart_init(void);
 
