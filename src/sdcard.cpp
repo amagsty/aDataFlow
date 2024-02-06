@@ -3,7 +3,8 @@
 bool is_rec_status_changing;
 static bool is_recording;
 static uint8_t led_blink_type; // 0 - idle, do nothing, 1 - slow, 2 - fast, 10 - on, others - off
-static File new_file;
+static File new_file_rx;
+static File new_file_tx;
 static char rand_folder_name[10];
 static bool is_first_check = true;
 
@@ -213,7 +214,8 @@ void testFileIO(fs::FS &fs, const char *path)
 void rec_stop()
 {
   log_i("stop recording...");
-  new_file.close();
+  new_file_rx.close();
+  new_file_tx.close();
   SD_MMC.end();
   led_blink_type = 99;
   is_recording = false;
@@ -221,7 +223,7 @@ void rec_stop()
   log_i("recording stopped");
 }
 
-void rec(String &s, const char *dir)
+void rec(bool is_rx, char *s)
 {
   if (is_rec_status_changing || is_recording == false)
   {
@@ -230,27 +232,48 @@ void rec(String &s, const char *dir)
   // hold power until written
   if (digitalRead(PIN_SD_CD) == LOW && batt_low == false)
   {
-    if (new_file)
+    hold_power_on = true;
+    if (is_rx)
     {
-      hold_power_on = true;
-      // rec format:
-      // 00000 TX content... \n
-      if (new_file.printf("%lu\t%s\t%s\n", millis(), dir, s.c_str()))
+      if (new_file_rx)
       {
-        log_d("rec %s: %s", dir, s.c_str());
+        if (new_file_rx.print(s))
+        {
+          log_d("rec rx: %s", s);
+        }
+        else
+        {
+          rec_stop();
+          log_e("rec rx error");
+        }
       }
       else
       {
         rec_stop();
-        log_e("rec error");
+        log_e("rx file error");
       }
-      hold_power_on = false;
     }
     else
     {
-      rec_stop();
-      log_e("file error");
+      if (new_file_tx)
+      {
+        if (new_file_tx.print(s))
+        {
+          log_d("rec tx: %s", s);
+        }
+        else
+        {
+          rec_stop();
+          log_e("rec tx error");
+        }
+      }
+      else
+      {
+        rec_stop();
+        log_e("tx file error");
+      }
     }
+    hold_power_on = false;
   }
   else
   {
@@ -389,19 +412,26 @@ static void task_rec_status(void *pvParameters)
                 }
               }
 
-              char path[30];
+              char path_rx[30];
+              char path_tx[30];
+              unsigned long m = millis();
               // /DAT_9999/4294967295.txt
-              snprintf(path, sizeof(path), "%s/%ld.txt", rand_folder_name, millis());
-              log_i("try this file: %s", path);
-              new_file = SD_MMC.open(path, FILE_APPEND);
-              if (!new_file)
+              snprintf(path_rx, sizeof(path_rx), "%s/RX_%ld.txt", rand_folder_name, m);
+              log_i("try this file rx: %s", path_rx);
+              new_file_rx = SD_MMC.open(path_rx, FILE_APPEND);
+
+              snprintf(path_tx, sizeof(path_tx), "%s/TX_%ld.txt", rand_folder_name, m);
+              log_i("try this file tx: %s", path_tx);
+              new_file_tx = SD_MMC.open(path_tx, FILE_APPEND);
+
+              if (!new_file_rx || !new_file_tx)
               {
                 log_e("failed to open file for saving");
                 rec_stop();
               }
               else
               {
-                log_i("rec to file: %s", path);
+                log_i("rx rec to file: %s, %s", path_rx, path_tx);
               }
             }
           }
