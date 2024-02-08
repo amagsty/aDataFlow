@@ -24,7 +24,7 @@
 
 2. 使用USB TypeC线连接小白白和电脑。(确保你的线是可以走数据的不是只充电)
    
-   <img src="img_刷机教程/cableSetup1.png" title="" alt="" width="256">
+   <img src="img_how_to_upload_firmware_BY_Justin/cableSetup1.png" title="" alt="" width="256">
 
 3. 此时电脑会无法正确识别到你的小白白，显示已连接但没有驱动.
 
@@ -71,19 +71,19 @@
 
 设置如下
 
-<img src="img_刷机教程/flashToolSetting-1.png" title="" alt="" width="201">
+<img src="img_how_to_upload_firmware_BY_Justin/flashToolSetting-1.png" title="" alt="" width="201">
 
 点击OK
 
 按如下内容修改你的设置。选择前面下载的bin文件。右下角正确设置你的COM我是COM4
 
-<img title="" src="img_刷机教程/flashToolSetting-2.png" alt="" width="309">
+<img title="" src="img_how_to_upload_firmware_BY_Justin/flashToolSetting-2.png" alt="" width="309">
 
 点击 `START` 开始刷:baby_chick:吧. 刷机过程中小白白会黑屏属于正常。刷机结束后重启小白白。
 
-<img title="" src="img_刷机教程/flashToolSetting-3.png" alt="" width="342">
+<img title="" src="img_how_to_upload_firmware_BY_Justin/flashToolSetting-3.png" alt="" width="342">
 
-<img src="img_刷机教程/flashToolSetting-4.png" title="" alt="" width="333">
+<img src="img_how_to_upload_firmware_BY_Justin/flashToolSetting-4.png" title="" alt="" width="333">
 
 #### 恭喜你闯过了刷机工具路线。:white_check_mark:
 
@@ -97,11 +97,11 @@
 
 1. 安装PlatformIO. 在插件中
 
-        <img src="img_刷机教程/VSCode-ExtentionButton.png" title="" alt="" width="50">
+        <img src="img_how_to_upload_firmware_BY_Justin/VSCode-ExtentionButton.png" title="" alt="" width="50">
 
     2. 搜索PlatformIO并安装
 
-        <img src="img_刷机教程/VSCode-ExtentionPlatformIOIDE.png" title="" alt="" width="344">
+        <img src="img_how_to_upload_firmware_BY_Justin/VSCode-ExtentionPlatformIOIDE.png" title="" alt="" width="344">
 
 3. 安装需要点时间，成功后会被提醒重启vscode。
 
@@ -113,7 +113,7 @@
 
 6. 此时回到vscode点击右上角的Build按键
 
-        <img src="img_刷机教程/VSCode-BuildButton.png" title="" alt="" width="274">
+        <img src="img_how_to_upload_firmware_BY_Justin/VSCode-BuildButton.png" title="" alt="" width="274">
 
         可能你会遇到error提示缺少lv_conf.h文件。
 
@@ -121,15 +121,15 @@
 
 7. 重新Build
 
-        <img src="img_刷机教程/VSCode-BuildSuccess.png" title="" alt="" width="575">
+        <img src="img_how_to_upload_firmware_BY_Justin/VSCode-BuildSuccess.png" title="" alt="" width="575">
 
 8. 成功build后连接上你的小白白点击Upload按键
 
-        <img title="" src="img_刷机教程/VSCode-UploadButton.png" alt="" width="294">
+        <img title="" src="img_how_to_upload_firmware_BY_Justin/VSCode-UploadButton.png" alt="" width="294">
 
         上传过程中小白白会黑屏并重启属于正常
 
-        <img src="img_刷机教程/VSCode-UploadSuccess.png" title="" alt="" width="583">
+        <img src="img_how_to_upload_firmware_BY_Justin/VSCode-UploadSuccess.png" title="" alt="" width="583">
 
 #### 成功上传后，恭喜你成功为小白白搭建了开发环境 :white_check_mark:。
 
