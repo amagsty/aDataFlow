@@ -6,7 +6,7 @@
 
 日期: 2024-2-4
 
-作者：amagsty，Justin
+作者：Justin
 
 ### :earth_asia:  小白白项目Gitee仓库链接
 
