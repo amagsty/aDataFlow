@@ -1,4 +1,6 @@
 #include "ui.h"
+#include "chart_validation.h"
+#include <stdio.h>
 
 // porting and backlight
 static lv_disp_draw_buf_t draw_buf;
@@ -52,7 +54,6 @@ static float batt_status_bound[8] = {3.98, 3.87, 3.79, 3.74, 3.68, 3.45, 3.1};
 static String batt_status_symbol[5] = {LV_SYMBOL_BATTERY_FULL, LV_SYMBOL_BATTERY_3, LV_SYMBOL_BATTERY_2, LV_SYMBOL_BATTERY_1, LV_SYMBOL_BATTERY_EMPTY};
 static uint8_t batt_status;
 static uint8_t ui_batt_status;
-static bool line_exceeded;
 bool is_mode_changing;
 
 // fonts
@@ -61,7 +62,7 @@ LV_FONT_DECLARE(ui_font_SFMono_23);
 LV_FONT_DECLARE(ui_font_SFMono_9);
 
 // mutex
-SemaphoreHandle_t lvgl_mutex = xSemaphoreCreateMutex();
+SemaphoreHandle_t lvgl_mutex = nullptr;
 
 // for info bar
 static uint32_t battery_votage_pre = 0;
@@ -111,43 +112,105 @@ static uint32_t chart_palette[CHART_COUNT_MAX] = COLOR_CHART_PALETTE;
 // ----------------------------------------
 // task and func
 // ----------------------------------------
+static char ui_legend_value_text[CHART_COUNT_MAX][48];
+
+static const lv_font_t *ui_fit_legend_font(bool captions)
+{
+    const lv_font_t *fonts[] = {&ui_font_SFMono_23, &ui_font_SFMono_14, &ui_font_SFMono_9};
+    const size_t first = captions || chart_series_prop.series_count >= 4 ? 1 : 0;
+    for (size_t candidate = first; candidate < 3; ++candidate)
+    {
+        bool fits = true;
+        for (size_t i = 0; i < chart_series_prop.series_count; ++i)
+        {
+            lv_obj_t *label = captions ? ui_group_legend_cap[i] : ui_group_legend_val[i];
+            const char *text = captions ? chart_series_prop.sername[i].c_str() : ui_legend_value_text[i];
+            const lv_coord_t spacing = lv_obj_get_style_text_letter_space(label, LV_PART_MAIN);
+            if (lv_txt_get_width(text, strlen(text), fonts[candidate], spacing, LV_TEXT_FLAG_NONE) >
+                lv_obj_get_content_width(label))
+            {
+                fits = false;
+                break;
+            }
+        }
+        if (fits)
+            return fonts[candidate];
+    }
+    return &ui_font_SFMono_9;
+}
+
+static void ui_refresh_legend_values()
+{
+    // Use one font for the entire value row, based on its widest value.
+    const lv_font_t *font = ui_fit_legend_font(false);
+    for (size_t i = 0; i < chart_series_prop.series_count; ++i)
+    {
+        lv_obj_t *label = ui_group_legend_val[i];
+        if (lv_obj_get_style_text_font(label, LV_PART_MAIN) != font)
+            lv_obj_set_style_text_font(label, font, LV_PART_MAIN | LV_STATE_DEFAULT);
+        if (strcmp(lv_label_get_text(label), ui_legend_value_text[i]) != 0)
+            lv_label_set_text(label, ui_legend_value_text[i]);
+    }
+}
+
+static void ui_set_legend_text(size_t index, const char *text)
+{
+    snprintf(ui_legend_value_text[index], sizeof(ui_legend_value_text[index]), "%s", text);
+    ui_refresh_legend_values();
+}
+
+static void ui_set_legend_number(size_t index, double value)
+{
+    char text[48];
+    snprintf(text, sizeof(text), chart_series_prop.value_fmt[index].c_str(), value);
+    lv_obj_t *label = ui_group_legend_val[index];
+    const lv_coord_t spacing = lv_obj_get_style_text_letter_space(label, LV_PART_MAIN);
+    if (lv_txt_get_width(text, strlen(text), &ui_font_SFMono_9, spacing, LV_TEXT_FLAG_NONE) >
+        lv_obj_get_content_width(label))
+        snprintf(text, sizeof(text), "%.2e", value);
+    ui_set_legend_text(index, text);
+}
+
+static void ui_update_legend_layout()
+{
+    for (size_t i = 0; i < CHART_COUNT_MAX; ++i)
+    {
+        if (i >= chart_series_prop.series_count)
+            lv_obj_add_flag(ui_group_legend_pan[i], LV_OBJ_FLAG_HIDDEN);
+        else
+        {
+            lv_obj_clear_flag(ui_group_legend_pan[i], LV_OBJ_FLAG_HIDDEN);
+            strcpy(ui_legend_value_text[i], "--");
+        }
+    }
+    lv_obj_update_layout(ui_panSeries);
+    // Captions share one font as well, selected against every visible name.
+    const lv_font_t *font = ui_fit_legend_font(true);
+    for (size_t i = 0; i < chart_series_prop.series_count; ++i)
+    {
+        lv_obj_set_style_text_font(ui_group_legend_cap[i], font, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_label_set_text(ui_group_legend_cap[i], chart_series_prop.sername[i].c_str());
+    }
+    ui_refresh_legend_values();
+}
+
 static void ui_update_chart_range(lv_obj_t *chart, struct chart_range *cr, lv_coord_t value)
 {
     cr->update_now = false;
-    if (cr->max < value)
+    if (!cr->is_initialized)
     {
-        cr->max = value;
+        cr->min = cr->max = value;
+        cr->is_initialized = true;
         cr->update_now = true;
     }
-    if (cr->min > value)
+    else
     {
-        cr->min = value;
-        cr->update_now = true;
+        if (value < cr->min) { cr->min = value; cr->update_now = true; }
+        if (value > cr->max) { cr->max = value; cr->update_now = true; }
     }
     if (cr->update_now || cr->update_forced)
-    {
-        if (cr->is_initialized)
-        {
-            lv_chart_set_range(chart, LV_CHART_AXIS_PRIMARY_Y, cr->min, cr->max);
-            log_i("chart range updated to: %ld, %ld", cr->min, cr->max);
-        }
-        else
-        {
-            if (value == 0)
-            {
-                log_i("chart range initialization skipped for zero value");
-            }
-            else
-            {
-                cr->max = value;
-                cr->min = value;
-                cr->is_initialized = true;
-                lv_chart_set_range(chart, LV_CHART_AXIS_PRIMARY_Y, value, value);
-                log_i("chart range initialized to: %ld", value);
-            }
-        }
-        cr->update_forced = false;
-    }
+        lv_chart_set_range(chart, LV_CHART_AXIS_PRIMARY_Y, cr->min, cr->max);
+    cr->update_forced = false;
 }
 
 static void ui_update_chart_color()
@@ -161,114 +224,101 @@ static void ui_update_chart_color()
     is_reset_chart_color_needed = false;
 }
 
-static void ui_update_chart_config(String &str_config)
+static void ui_update_chart_config(JsonDocument &config)
 {
-    /**
-     * config template:
-
-        {"config":"weather_station", // config JSON must start with {"config"
-        "chart_series":[
-            {"name":"ser1", // must exist or it will be ignored
-            "min":5, // optional, will be set dynamically
-            "max":10, // optional, will be set dynamically
-            "scale":100, // optional, default: 100
-            "fmt":"%.1f", // optional, default: "%.1f
-            "color":"0xFF0000" // optional, default: COLOR_CHART_PALETTE
-            },
-            ...],
-        "chart_bg":"0x000000"} // optional, default: "0x000000"
-
-     */
-
-    JsonDocument doc_config;
-    DeserializationError error = deserializeJson(doc_config, str_config);
-    if (error)
+    uint32_t color;
+    if (!config["chart_bg"].isNull())
     {
-        log_i("doc_config deserializeJson() failed: %s", error.c_str());
-        return;
-    }
-
-    // chart bg
-    if (!doc_config["chart_bg"].isNull())
-    {
-        chart_series_prop.bgcolor = strtoimax(doc_config["chart_bg"], NULL, 16); // unknown format will return 0(black)
-        is_reset_chart_color_needed = true;
-        log_i("chart_bg set to: %u", chart_series_prop.bgcolor);
-    }
-
-    // This is an existing config array. `to<JsonArray>()` clears the value
-    // before converting it, which silently discarded all configured series.
-    JsonArray ser = doc_config["chart_series"].as<JsonArray>();
-    uint8_t ser_index = 0;
-    for (JsonObject s : ser)
-    {
-        if (ser_index >= CHART_COUNT_MAX)
-            break;
-
-        if (!s["name"].isNull())
+        if (chart_validation::parse_color(config["chart_bg"].as<const char *>(), color))
         {
-            // name
-            chart_series_prop.sername[ser_index] = s["name"].as<String>();
+            chart_series_prop.bgcolor = color;
+            is_reset_chart_color_needed = true;
+        }
+        else
+            log_w("invalid chart_bg; keeping previous color");
+    }
 
-            // scale
-            if (!s["scale"].isNull())
-            {
-                chart_ranges[ser_index].value_scale = s["scale"].as<uint32_t>();
-                log_i("chart_value_scale: %u - %u", ser_index, chart_ranges[ser_index].value_scale);
-            }
+    // Read the existing array without converting/clearing it.
+    JsonArrayConst series = config["chart_series"].as<JsonArrayConst>();
+    uint8_t index = 0;
+    for (JsonObjectConst item : series)
+    {
+        if (index >= CHART_COUNT_MAX)
+            break;
+        const char *name = item["name"].as<const char *>();
+        if (name == nullptr || name[0] == '\0' || strlen(name) > 64)
+        {
+            log_w("invalid chart series name; skipping entry");
+            continue;
+        }
+        bool duplicate = false;
+        for (uint8_t i = 0; i < index; ++i)
+            duplicate |= chart_series_prop.sername[i] == name;
+        if (duplicate)
+        {
+            log_w("duplicate chart series name: %s", name);
+            continue;
+        }
 
-            // range
-            if (!s["min"].isNull() && !s["max"].isNull())
+        chart_series_prop.sername[index] = name;
+        chart_ranges[index] = chart_range{};
+        chart_series_prop.palette[index] = chart_palette[index];
+        chart_series_prop.value_fmt[index] = CHART_VALUE_FMT_DEFAULT;
+
+        if (!item["scale"].isNull())
+        {
+            if (item["scale"].is<uint32_t>() && item["scale"].as<uint32_t>() > 0 &&
+                item["scale"].as<uint32_t>() <= chart_validation::SCALE_LIMIT)
+                chart_ranges[index].value_scale = item["scale"].as<uint32_t>();
+            else
+                log_w("invalid chart scale; using default");
+        }
+
+        if (!item["min"].isNull() || !item["max"].isNull())
+        {
+            int32_t low, high;
+            if (item["min"].is<double>() && item["max"].is<double>() &&
+                chart_validation::make_range(item["min"].as<double>(), item["max"].as<double>(),
+                                             chart_ranges[index].value_scale, low, high))
             {
-                if (s["min"].as<long>() > s["max"].as<long>())
-                {
-                    chart_ranges[ser_index].min = chart_ranges[ser_index].value_scale * s["max"].as<float>();
-                    chart_ranges[ser_index].max = chart_ranges[ser_index].value_scale * s["min"].as<float>();
-                }
-                else
-                {
-                    chart_ranges[ser_index].min = chart_ranges[ser_index].value_scale * s["min"].as<float>();
-                    chart_ranges[ser_index].max = chart_ranges[ser_index].value_scale * s["max"].as<float>();
-                }
-                chart_ranges[ser_index].is_initialized = true;
-                lv_chart_set_range(ui_group_chart[ser_index], LV_CHART_AXIS_PRIMARY_Y, chart_ranges[ser_index].min, chart_ranges[ser_index].max);
-                log_i("chart_range is set to: min - %d, max - %d", chart_ranges[ser_index].min, chart_ranges[ser_index].max);
+                chart_ranges[index].min = low;
+                chart_ranges[index].max = high;
+                chart_ranges[index].is_initialized = true;
+                lv_chart_set_range(ui_group_chart[index], LV_CHART_AXIS_PRIMARY_Y, low, high);
             }
             else
-            {
-                chart_ranges[ser_index].is_initialized = false;
-            }
-
-            // format
-            if (!s["fmt"].isNull())
-            {
-                chart_series_prop.value_fmt[ser_index] = s["fmt"].as<String>();
-                log_i("chart_value_fmt: %u - %s", ser_index, chart_series_prop.value_fmt[ser_index]);
-            }
-
-            // color
-            if (!s["color"].isNull())
-            {
-                chart_series_prop.palette[ser_index] = strtoimax(s["color"], NULL, 16); // unknown format will return 0(black)
-                log_i("chart_palette: %u - %u", ser_index, chart_series_prop.palette[ser_index]);
-            }
-            ser_index++;
+                log_w("invalid chart range; using automatic range");
         }
+
+        if (!item["fmt"].isNull())
+        {
+            const char *format = item["fmt"].as<const char *>();
+            if (chart_validation::valid_format(format))
+                chart_series_prop.value_fmt[index] = format;
+            else
+                log_w("invalid chart format; using default");
+        }
+        if (!item["color"].isNull())
+        {
+            if (chart_validation::parse_color(item["color"].as<const char *>(), color))
+                chart_series_prop.palette[index] = color;
+            else
+                log_w("invalid chart color; using default");
+        }
+        ++index;
     }
-    if (ser_index > 0)
+    if (index > 0)
     {
         chart_series_prop.is_set_by_config = true;
-        chart_series_prop.series_count = ser_index;
+        chart_series_prop.series_count = index;
         is_prepare_sername_needed = true;
         is_reset_chart_color_needed = true;
-        for (size_t i = 0; i < CHART_COUNT_MAX; i++)
-        {
+        for (size_t i = 0; i < CHART_COUNT_MAX; ++i)
             lv_chart_set_all_value(ui_group_chart[i], ui_group_chart_series[i], LV_CHART_POINT_NONE);
-            lv_chart_refresh(ui_group_chart[i]);
-        }
         lv_obj_set_x(ui_cursorV, -20);
-        ui_update_chart_color();
     }
+    if (is_reset_chart_color_needed)
+        ui_update_chart_color();
 }
 
 static void ui_task_update_topbar(void *pvParameters)
@@ -385,18 +435,9 @@ static void ui_task_update_topbar(void *pvParameters)
 
 static void ui_term_new_line(bool is_rx)
 {
-    // remove old lines
-    if (line_exceeded)
-    {
+    // Keep history bounded even while the terminal is covered by the chart.
+    while (lv_obj_get_child_cnt(ui_panList) >= TERM_ROW_MAX_NUM)
         lv_obj_del(lv_obj_get_child(ui_panList, 0));
-    }
-    else
-    {
-        if (lv_obj_get_child_cnt(ui_panList) >= TERM_ROW_MAX_NUM)
-        {
-            line_exceeded = true;
-        }
-    }
 
     // add one new line
     currentLine = lv_label_create(ui_panList);
@@ -421,7 +462,13 @@ static void ui_term_new_line(bool is_rx)
 
     // update line number
     lineCount++;
-    lv_label_set_text_fmt(ui_lblLineCounter, "%u", lineCount);
+    lv_label_set_text_fmt(ui_lblLineCounter, "%lu", (unsigned long)lineCount);
+}
+
+static void ui_record_terminal_line(bool is_rx, const char *text)
+{
+    ui_term_new_line(is_rx);
+    lv_label_set_text(currentLine, text);
 }
 
 static void ui_star_shoot(bool is_rx, char *data)
@@ -448,9 +495,6 @@ static void ui_task_update_main_screen(void *pvParameters)
     bool cuurent_is_rx;
 
     // chart
-    lv_point_t p;
-    lv_coord_t point_value;
-    float raw_value;
     bool ui_panWaiting_is_visible = true;
 
     for (;;)
@@ -500,29 +544,28 @@ static void ui_task_update_main_screen(void *pvParameters)
                         if (is_new_line)
                         {
                             current_str = pch;
+                            // Capture terminal history in both views, exactly once per line.
+                            ui_record_terminal_line(q.is_rx, pch);
+                            ui_star_shoot(q.is_rx, pch);
 
-                            // check if chart-config line: start with {"config" or {'config'
-                            if (strcmp(current_str.substring(2, 8).c_str(), "config") == 0)
-                            {
-                                ui_update_chart_config(current_str);
-                            }
+                            JsonDocument doc;
+                            const DeserializationError error = deserializeJson(doc, pch);
+                            const bool is_config_line = !error && doc.is<JsonObject>() && !doc["config"].isNull();
+                            if (is_config_line)
+                                ui_update_chart_config(doc);
 
                             // update ui
                             if (is_chart)
                             {
-                                // update line number
-                                lineCount++;
-                                lv_label_set_text_fmt(ui_lblLineCounter, "%u", lineCount);
-                                ui_star_shoot(q.is_rx, pch);
-
-                                JsonDocument doc; // do not reuse this doc, it will cause memory leak
-                                DeserializationError error = deserializeJson(doc, pch);
-
                                 // attention: only JsonObject would be accepted
                                 // {"a":123} ok
                                 // [123,123] skip
 
-                                if (error || !doc.is<JsonObject>())
+                                if (is_config_line)
+                                {
+                                    // A control/configuration frame must not generate zero samples.
+                                }
+                                else if (error || !doc.is<JsonObject>())
                                 {
                                     lv_label_set_text(ui_lblQString, pch);
                                     if (!ui_panWaiting_is_visible)
@@ -535,117 +578,81 @@ static void ui_task_update_main_screen(void *pvParameters)
                                 {
                                     if (is_prepare_sername_needed)
                                     {
-                                        if (chart_series_prop.is_set_by_config)
+                                        if (!chart_series_prop.is_set_by_config)
                                         {
-                                            // chart ser name was set by config json
-                                            for (size_t i = 0; i < CHART_COUNT_MAX; i++)
+                                            chart_series_prop.series_count = 0;
+                                            for (JsonPairConst pair : doc.as<JsonObjectConst>())
                                             {
-                                                if (i >= chart_series_prop.series_count)
-                                                {
-                                                    // these series will be hidden
-                                                    lv_obj_add_flag(ui_group_legend_pan[i], LV_OBJ_FLAG_HIDDEN);
-                                                    log_i("mark hide chart_series_names: %u", i);
-                                                }
-                                                else
-                                                {
-                                                    // reset legend
-                                                    lv_obj_clear_flag(ui_group_legend_pan[i], LV_OBJ_FLAG_HIDDEN);
-                                                    lv_label_set_text(ui_group_legend_cap[i], chart_series_prop.sername[i].c_str());
-                                                    lv_obj_set_width(ui_group_legend_pan[i], lv_pct(100 / chart_series_prop.series_count));
-
-                                                    log_i("reset chart_series_names_by_config: %u/%u - %s", i, chart_series_prop.series_count, chart_series_prop.sername[i]);
-                                                }
+                                                if (chart_series_prop.series_count >= CHART_COUNT_MAX)
+                                                    break;
+                                                if (!pair.value().is<double>() || !std::isfinite(pair.value().as<double>()))
+                                                    continue;
+                                                chart_series_prop.sername[chart_series_prop.series_count++] = pair.key().c_str();
                                             }
                                         }
-                                        else
-                                        {
-                                            // Chart will be set by the first line of JSON if no config info received
-                                            // make sure series count is under CHART_COUNT_MAX
-                                            chart_series_prop.series_count = doc.size() >= CHART_COUNT_MAX ? CHART_COUNT_MAX : doc.size();
-
-                                            JsonObject::iterator it = doc.as<JsonObject>().begin();
-                                            for (size_t i = 0; i < CHART_COUNT_MAX; i++)
-                                            {
-                                                if (i >= chart_series_prop.series_count)
-                                                {
-                                                    // these series will be hidden
-                                                    lv_obj_add_flag(ui_group_legend_pan[i], LV_OBJ_FLAG_HIDDEN);
-                                                    log_i("mark hide chart_series_names: %u", i);
-                                                }
-                                                else
-                                                {
-                                                    chart_series_prop.sername[i] = it->key().c_str(); // copy the content
-
-                                                    // reset legend
-                                                    lv_obj_clear_flag(ui_group_legend_pan[i], LV_OBJ_FLAG_HIDDEN);
-                                                    lv_label_set_text(ui_group_legend_cap[i], chart_series_prop.sername[i].c_str());
-                                                    lv_obj_set_width(ui_group_legend_pan[i], lv_pct(100 / chart_series_prop.series_count));
-
-                                                    log_i("reset chart_series_names: %u/%u - %s", i, chart_series_prop.series_count, chart_series_prop.sername[i]);
-                                                    it.operator++();
-                                                }
-                                            }
-
-                                            // reset chart range/scale
-                                            // for (size_t i = 0; i < CHART_COUNT_MAX; i++)
-                                            // {
-                                            //     chart_ranges[i].is_initialized = false;
-                                            // }
-                                        }
+                                        ui_update_legend_layout();
 
                                         log_i("chart_series_names inited, count:%d", chart_series_prop.series_count);
-                                        is_prepare_sername_needed = false;
+                                        is_prepare_sername_needed = chart_series_prop.series_count == 0;
                                     }
 
-                                    // update chart
-                                    for (size_t i = 0; i < chart_series_prop.series_count; i++)
+                                    if (chart_series_prop.series_count == 0)
                                     {
-                                        raw_value = doc[chart_series_prop.sername[i]].as<float>();
-                                        point_value = raw_value * chart_ranges[i].value_scale;
-                                        ui_update_chart_range(ui_group_chart[i], &chart_ranges[i], point_value);
-                                        lv_chart_set_next_value(ui_group_chart[i], ui_group_chart_series[i], point_value);
-                                        lv_label_set_text_fmt(ui_group_legend_val[i], chart_series_prop.value_fmt[i].c_str(), raw_value);
+                                        lv_label_set_text(ui_lblQString, "No numeric fields");
+                                        if (!ui_panWaiting_is_visible)
+                                        {
+                                            lv_obj_fade_in(ui_panWaiting, 100, 0);
+                                            ui_panWaiting_is_visible = true;
+                                        }
                                     }
-
-                                    // In shift mode, each new sample appears at the right edge.
-                                    lv_chart_get_point_pos_by_id(ui_group_chart[0], ui_group_chart_series[0], chart_point_count - 1, &p);
-                                    lv_obj_set_x(ui_cursorV, p.x + 14);
-
-                                    // display the legend
-                                    if (ui_panWaiting_is_visible)
+                                    else
                                     {
-                                        lv_obj_fade_out(ui_panWaiting, 200, 0);
-                                        ui_panWaiting_is_visible = false;
+                                        // update chart
+                                        for (size_t i = 0; i < chart_series_prop.series_count; i++)
+                                        {
+                                            JsonVariantConst value = doc[chart_series_prop.sername[i]];
+                                            int32_t coordinate;
+                                            if (!value.is<double>() ||
+                                                !chart_validation::scale_value(value.as<double>(), chart_ranges[i].value_scale, coordinate))
+                                            {
+                                                lv_chart_set_next_value(ui_group_chart[i], ui_group_chart_series[i], LV_CHART_POINT_NONE);
+                                                ui_set_legend_text(i, "--");
+                                                continue;
+                                            }
+                                            ui_update_chart_range(ui_group_chart[i], &chart_ranges[i], coordinate);
+                                            lv_chart_set_next_value(ui_group_chart[i], ui_group_chart_series[i], coordinate);
+                                            ui_set_legend_number(i, value.as<double>());
+                                        }
+
+                                        // In shift mode, each new sample appears at the right edge.
+                                        const lv_coord_t right_edge = lv_obj_get_content_width(ui_group_chart[0]) +
+                                            lv_obj_get_style_pad_left(ui_group_chart[0], LV_PART_MAIN) +
+                                            lv_obj_get_style_border_width(ui_group_chart[0], LV_PART_MAIN);
+                                        lv_obj_set_x(ui_cursorV, right_edge + 14);
+
+                                        // display the legend
+                                        if (ui_panWaiting_is_visible)
+                                        {
+                                            lv_obj_fade_out(ui_panWaiting, 200, 0);
+                                            ui_panWaiting_is_visible = false;
+                                        }
                                     }
                                 }
-                            }
-                            else
-                            {
-                                ui_term_new_line(q.is_rx);
-                                ui_star_shoot(q.is_rx, pch);
-                                lv_label_set_text(currentLine, pch);
                             }
                         }
                         else
                         {
                             ui_star_shoot(q.is_rx, pch);
                             if (is_chart)
-                            {
                                 lv_label_set_text(ui_lblQString, pch);
-                            }
+                            if (strlen(current_str.c_str()) < TERM_LINE_MAX_LENGTH)
+                                current_str += pch;
                             else
                             {
-                                if (strlen(current_str.c_str()) < TERM_LINE_MAX_LENGTH)
-                                {
-                                    current_str += pch;
-                                }
-                                else
-                                {
-                                    ui_term_new_line(q.is_rx);
-                                    current_str = pch;
-                                }
-                                lv_label_set_text(currentLine, current_str.c_str());
+                                ui_term_new_line(q.is_rx);
+                                current_str = pch;
                             }
+                            lv_label_set_text(currentLine, current_str.c_str());
                         }
 
                         pch = strtok(NULL, "\r\n");
@@ -679,18 +686,8 @@ static void ui_task_update_main_screen(void *pvParameters)
 
 static void ui_term_new_line_test_mode(const char *s)
 {
-    // remove old lines
-    if (line_exceeded)
-    {
+    while (lv_obj_get_child_cnt(ui_panList) >= TERM_ROW_MAX_NUM)
         lv_obj_del(lv_obj_get_child(ui_panList, 0));
-    }
-    else
-    {
-        if (lv_obj_get_child_cnt(ui_panList) >= TERM_ROW_MAX_NUM)
-        {
-            line_exceeded = true;
-        }
-    }
     currentLine = lv_label_create(ui_panList);
     lv_obj_set_width(currentLine, lv_pct(100));
     lv_obj_set_height(currentLine, LV_SIZE_CONTENT); /// 1
@@ -707,7 +704,7 @@ static void ui_term_new_line_test_mode(const char *s)
         lv_obj_scroll_to_view(currentLine, LV_ANIM_OFF);
     }
     lineCount++;
-    lv_label_set_text_fmt(ui_lblLineCounter, "%u", lineCount);
+    lv_label_set_text_fmt(ui_lblLineCounter, "%lu", (unsigned long)lineCount);
 }
 
 static void ui_task_update_main_screen_test_mode(void *pvParameters)
@@ -843,18 +840,10 @@ static void ui_event_panList(lv_event_t *e)
             for (size_t i = 0; i < chart_series_prop.series_count; i++)
             {
                 lv_coord_t *ser_values = lv_chart_get_y_array(ui_group_chart[i], ui_group_chart_series[i]);
-                if (ser_values[0] != 2147483647)
+                if (chart_validation::find_range(ser_values, chart_point_count, lv_coord_t(LV_CHART_POINT_NONE),
+                                                 chart_ranges[i].min, chart_ranges[i].max))
                 {
-                    chart_ranges[i].min = ser_values[0];
-                    chart_ranges[i].max = ser_values[0];
-                    for (size_t j = 0; j < chart_point_count; j++)
-                    {
-                        if (ser_values[j] != 2147483647)
-                        {
-                            chart_ranges[i].min = ser_values[j] < chart_ranges[i].min ? ser_values[j] : chart_ranges[i].min;
-                            chart_ranges[i].max = ser_values[j] > chart_ranges[i].max ? ser_values[j] : chart_ranges[i].max;
-                        }
-                    }
+                    chart_ranges[i].is_initialized = true;
                     lv_chart_set_range(ui_group_chart[i], LV_CHART_AXIS_PRIMARY_Y, chart_ranges[i].min, chart_ranges[i].max);
                     lv_chart_refresh(ui_group_chart[i]);
                     log_i("chart range reset manually to: %ld, %ld", chart_ranges[i].min, chart_ranges[i].max);
@@ -889,11 +878,23 @@ static void lv_my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_colo
     }
     display.pushImageDMA(area->x1, area->y1, area->x2 - area->x1 + 1, area->y2 - area->y1 + 1, (lgfx::swap565_t *)&color_p->full);
     lv_disp_flush_ready(disp);
+    static bool first_flush = true;
+    if (first_flush)
+    {
+        first_flush = false;
+        log_i("UI: first display flush submitted, heap=%lu", (unsigned long)ESP.getFreeHeap());
+    }
 }
 
-static void lv_port_init(void)
+static bool lv_port_init(void)
 {
-    display.begin();
+    log_i("UI: LCD begin, heap=%lu", (unsigned long)ESP.getFreeHeap());
+    if (!display.begin())
+    {
+        log_e("UI: LCD initialization failed");
+        return false;
+    }
+    log_i("UI: LCD initialized");
     display.setBrightness(0);
     display.setRotation(1); /* Landscape orientation, flipped */
 
@@ -910,7 +911,11 @@ static void lv_port_init(void)
     disp_drv.ver_res = SCREEN_HEIGHT;
     disp_drv.flush_cb = lv_my_disp_flush;
     disp_drv.draw_buf = &draw_buf;
-    lv_disp_drv_register(&disp_drv);
+    if (lv_disp_drv_register(&disp_drv) == nullptr)
+    {
+        log_e("UI: display registration failed");
+        return false;
+    }
 
     /*Initialize the input device driver for LVGL*/
     if (!test_mode)
@@ -921,8 +926,15 @@ static void lv_port_init(void)
         indev_drv.read_cb = ui_hw_encoder_read;
         indev_encoder = lv_indev_drv_register(&indev_drv);
         group_encoder = lv_group_create();
+        if (indev_encoder == nullptr || group_encoder == nullptr)
+        {
+            log_e("UI: input device or group allocation failed");
+            return false;
+        }
         lv_indev_set_group(indev_encoder, group_encoder);
     }
+    log_i("UI: LVGL port ready, heap=%lu", (unsigned long)ESP.getFreeHeap());
+    return true;
 }
 
 static void lv_task_timer(void *pvParameters)
@@ -1258,10 +1270,17 @@ static void ui_draw_main_screen(void)
     lv_obj_set_style_bg_color(ui_panSeries, lv_color_hex(COLOR_SHADOW), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_bg_opa(ui_panSeries, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(ui_panSeries, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_all(ui_panSeries, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_column(ui_panSeries, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
 
     for (size_t i = 0; i < CHART_COUNT_MAX; i++)
     {
         ui_group_legend_pan[i] = lv_obj_create(ui_panSeries);
+        lv_obj_set_width(ui_group_legend_pan[i], 0);
+        lv_obj_set_flex_grow(ui_group_legend_pan[i], 1);
+        lv_obj_set_flex_flow(ui_group_legend_pan[i], LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(ui_group_legend_pan[i], LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_row(ui_group_legend_pan[i], 4, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_height(ui_group_legend_pan[i], 58);
         lv_obj_set_align(ui_group_legend_pan[i], LV_ALIGN_CENTER);
         lv_obj_clear_flag(ui_group_legend_pan[i], LV_OBJ_FLAG_SCROLLABLE); /// Flags
@@ -1275,11 +1294,8 @@ static void ui_draw_main_screen(void)
         lv_obj_set_style_pad_bottom(ui_group_legend_pan[i], 0, LV_PART_MAIN | LV_STATE_DEFAULT);
 
         ui_group_legend_cap[i] = lv_label_create(ui_group_legend_pan[i]);
-        lv_obj_set_width(ui_group_legend_cap[i], LV_SIZE_CONTENT);
+        lv_obj_set_width(ui_group_legend_cap[i], lv_pct(100));
         lv_obj_set_height(ui_group_legend_cap[i], LV_SIZE_CONTENT); /// 1
-        lv_obj_set_x(ui_group_legend_cap[i], 0);
-        lv_obj_set_y(ui_group_legend_cap[i], 9);
-        lv_obj_set_align(ui_group_legend_cap[i], LV_ALIGN_TOP_MID);
         lv_label_set_long_mode(ui_group_legend_cap[i], LV_LABEL_LONG_DOT);
         lv_label_set_text(ui_group_legend_cap[i], "-");
         lv_obj_set_style_text_color(ui_group_legend_cap[i], lv_color_hex(COLOR_CHART_SERIES_NAME_TEXT), LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -1291,18 +1307,17 @@ static void ui_draw_main_screen(void)
         lv_obj_set_style_pad_left(ui_group_legend_cap[i], 5, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_pad_right(ui_group_legend_cap[i], 5, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_pad_top(ui_group_legend_cap[i], 2, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_pad_bottom(ui_group_legend_cap[i], 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_pad_bottom(ui_group_legend_cap[i], 2, LV_PART_MAIN | LV_STATE_DEFAULT);
 
         ui_group_legend_val[i] = lv_label_create(ui_group_legend_pan[i]);
         lv_obj_set_width(ui_group_legend_val[i], lv_pct(100));
         lv_obj_set_height(ui_group_legend_val[i], LV_SIZE_CONTENT); /// 1
-        lv_obj_set_y(ui_group_legend_val[i], -2);
-        lv_obj_set_align(ui_group_legend_val[i], LV_ALIGN_BOTTOM_MID);
-        lv_label_set_long_mode(ui_group_legend_val[i], LV_LABEL_LONG_DOT);
-        lv_label_set_text(ui_group_legend_val[i], "...");
+        lv_label_set_long_mode(ui_group_legend_val[i], LV_LABEL_LONG_CLIP);
+        lv_label_set_text(ui_group_legend_val[i], "--");
         lv_obj_set_style_text_color(ui_group_legend_val[i], lv_color_hex(COLOR_CHART_SERIES_VALUE_TEXT), LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_text_opa(ui_group_legend_val[i], 255, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_text_align(ui_group_legend_val[i], LV_TEXT_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_pad_all(ui_group_legend_val[i], 0, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_text_font(ui_group_legend_val[i], &ui_font_SFMono_23, LV_PART_MAIN | LV_STATE_DEFAULT);
     }
 
@@ -1539,40 +1554,57 @@ static void ui_draw_main_screen_test_mode(void)
     lv_disp_load_scr(ui_scrMain);
 }
 
-static void ui_init_elements_ani(void *pvParameters)
+static uint32_t ui_startup_ms;
+static bool ui_editing_enabled;
+
+// Runs inside lv_timer_handler(), while lvgl_mutex is held by lv_task_timer.
+static void ui_startup_tick(lv_timer_t *timer)
 {
-    lv_obj_set_style_opa(ui_panContainerChart, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    lv_anim_t a_infobar;
-    lv_anim_init(&a_infobar);
-    lv_anim_set_var(&a_infobar, ui_panInfo);
-    lv_anim_set_delay(&a_infobar, 359);
-    lv_anim_set_time(&a_infobar, 359);
-    lv_anim_set_exec_cb(&a_infobar, (lv_anim_exec_xcb_t)lv_obj_set_y);
-    lv_anim_set_path_cb(&a_infobar, lv_anim_path_ease_out);
-    lv_anim_set_values(&a_infobar, -27, 0);
-    lv_anim_start(&a_infobar);
-
-    vTaskDelay(5000);
-
-    lv_group_set_editing(group_encoder, true);
-
-    vTaskDelete(NULL);
+    if (lineCount > 0 && ui_imgSplash != nullptr)
+    {
+        lv_obj_del(ui_imgSplash);
+        ui_imgSplash = nullptr;
+    }
+    if (!ui_editing_enabled && millis() - ui_startup_ms >= 5000)
+    {
+        lv_group_set_editing(group_encoder, true);
+        ui_editing_enabled = true;
+    }
+    if (ui_imgSplash == nullptr && ui_editing_enabled)
+        lv_timer_del(timer);
 }
 
-static void ui_init_remove_elements_ani(void *pvParameters)
+static void ui_start_animations(void)
 {
-    for (;;)
+    // Register animations before any UI worker is started.
+    lv_obj_set_style_opa(ui_panContainerChart, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_anim_t animation;
+    lv_anim_init(&animation);
+    lv_anim_set_var(&animation, ui_panInfo);
+    lv_anim_set_delay(&animation, 359);
+    lv_anim_set_time(&animation, 359);
+    lv_anim_set_exec_cb(&animation, (lv_anim_exec_xcb_t)lv_obj_set_y);
+    lv_anim_set_path_cb(&animation, lv_anim_path_ease_out);
+    lv_anim_set_values(&animation, -27, 0);
+    lv_anim_start(&animation);
+    ui_startup_ms = millis();
+    ui_editing_enabled = false;
+    if (lv_timer_create(ui_startup_tick, 50, nullptr) == nullptr)
     {
-        if (lineCount > 0)
-        {
-            lv_obj_del(ui_imgSplash);
-            vTaskDelay(100);
-            vTaskDelete(NULL);
-        }
-        vTaskDelay(10);
+        log_e("UI: startup timer allocation failed");
+        lv_obj_del(ui_imgSplash);
+        ui_imgSplash = nullptr;
+        lv_group_set_editing(group_encoder, true);
+        ui_editing_enabled = true;
     }
-    vTaskDelete(NULL);
+}
+
+static bool ui_create_task(TaskFunction_t task, const char *name, UBaseType_t priority)
+{
+    if (xTaskCreatePinnedToCore(task, name, 8192, nullptr, priority, nullptr, 1) == pdPASS)
+        return true;
+    log_e("UI: task creation failed: %s, heap=%lu", name, (unsigned long)ESP.getFreeHeap());
+    return false;
 }
 
 // ----------------------------------------
@@ -1587,24 +1619,33 @@ void ui_init(void)
     ui_info_5v_in = !mon_is_5v_in;
     ui_info_is_charging_idle = !mon_is_charging_idle;
 
+    lvgl_mutex = xSemaphoreCreateMutex();
+    if (lvgl_mutex == nullptr)
+    {
+        log_e("UI: mutex allocation failed");
+        return;
+    }
     new_gamma_table(LCD_BKL_GAMMA);
-    lv_port_init();
+    if (!lv_port_init())
+        return;
 
     if (test_mode)
-    {
         ui_draw_main_screen_test_mode();
-        xTaskCreatePinnedToCore(ui_task_update_main_screen_test_mode, "update main screen test mode", 8192, NULL, 5, NULL, 1);
-    }
     else
     {
         ui_draw_main_screen();
-        xTaskCreatePinnedToCore(ui_init_elements_ani, "first run animations", 8192, NULL, 9, NULL, 1);
-        xTaskCreatePinnedToCore(ui_init_remove_elements_ani, "remove init elements", 8192, NULL, 9, NULL, 1);
-        xTaskCreatePinnedToCore(ui_task_update_main_screen, "update main screen", 8192, NULL, 5, NULL, 1);
+        ui_start_animations();
     }
+    log_i("UI: screen loaded, mode=%s, heap=%lu", test_mode ? "test" : "normal",
+          (unsigned long)ESP.getFreeHeap());
 
-    xTaskCreatePinnedToCore(lv_task_timer, "lv timer", 8192, NULL, 9, NULL, 1);
-    xTaskCreatePinnedToCore(hw_task_backlight, "update backlight", 8192, NULL, 9, NULL, 1);
-    xTaskCreatePinnedToCore(ui_task_update_topbar, "update top info bar", 8192, NULL, 1, NULL, 1);
-    xTaskCreatePinnedToCore(ui_task_toggle_chart_terminal, "toggle chart terminal", 8192, NULL, 1, NULL, 1);
+    if (!ui_create_task(lv_task_timer, "lv timer", 9))
+        return;
+    if (test_mode)
+        ui_create_task(ui_task_update_main_screen_test_mode, "update main screen test mode", 5);
+    else
+        ui_create_task(ui_task_update_main_screen, "update main screen", 5);
+    ui_create_task(hw_task_backlight, "update backlight", 9);
+    ui_create_task(ui_task_update_topbar, "update top info bar", 1);
+    ui_create_task(ui_task_toggle_chart_terminal, "toggle chart terminal", 1);
 }
