@@ -11,7 +11,7 @@ public:
     void push(uint32_t value)
     {
         arr[index] = value;
-        index = index < 3 ? index + 1 : 0;
+        index = (index + 1) % 3;
     }
     uint32_t result()
     {
