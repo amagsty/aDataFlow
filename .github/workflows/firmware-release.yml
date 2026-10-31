@@ -1,0 +1,49 @@
+name: Build and release firmware
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# A branch push and tag push can refer to the same version. Publish serially.
+concurrency:
+  group: firmware-release
+  cancel-in-progress: false
+
+jobs:
+  firmware:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install PlatformIO
+        run: python -m pip install platformio==6.2.0
+      - name: Build ESP32-S3 N8R2
+        run: pio run -e esp32s3dev_n8r2
+      - name: Check input validation and recording boundaries
+        run: python scripts/run_host_checks.py --ui-layout
+      - name: Package firmware for address 0x0000
+        run: python scripts/firmware_release.py package
+      - name: Keep build artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: firmware-${{ github.sha }}
+          path: |
+            dist/*-full.bin
+            dist/SHA256SUMS.txt
+            dist/RELEASE_NOTES.md
+          if-no-files-found: error
+      - name: Publish a new version
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python scripts/firmware_release.py publish
