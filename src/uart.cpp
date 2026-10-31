@@ -64,11 +64,17 @@ static void enqueue_uart_line(uart_line_buffer_t *line, bool is_rx)
 
 static void collect_uart_lines(HardwareSerial &serial, uart_line_buffer_t *line, bool is_rx)
 {
+    if (bandrate_auto_state == AutoBaudState::Measuring)
+        *line = {};
     while (serial.available() > 0)
     {
         int value = serial.read();
         if (value < 0)
             break;
+        // The current decoder may be at the wrong baud while hardware measures
+        // the signal. Do not display or record those bytes as captured data.
+        if (bandrate_auto_state == AutoBaudState::Measuring)
+            continue;
 
         char c = static_cast<char>(value);
         bool is_line_end = (c == '\r' || c == '\n');

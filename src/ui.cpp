@@ -273,14 +273,22 @@ static void ui_update_chart_config(String &str_config)
 
 static void ui_task_update_topbar(void *pvParameters)
 {
+    AutoBaudState displayed_auto_state = AutoBaudState::Idle;
     for (;;)
     {
         if (pdTRUE == xSemaphoreTake(lvgl_mutex, portMAX_DELAY))
         {
-            if (ui_info_bandrate_index != bandrate_index)
+            const AutoBaudState auto_state = bandrate_auto_state;
+            if (ui_info_bandrate_index != bandrate_index || displayed_auto_state != auto_state)
             {
-                lv_label_set_text_fmt(ui_lblBandrate, "%u", bandrate_list[bandrate_index]);
+                if (auto_state == AutoBaudState::Measuring)
+                    lv_label_set_text(ui_lblBandrate, "AUTO...");
+                else if (auto_state == AutoBaudState::Failed)
+                    lv_label_set_text(ui_lblBandrate, "AUTO?");
+                else
+                    lv_label_set_text_fmt(ui_lblBandrate, "%lu", (unsigned long)bandrate_list[bandrate_index]);
                 ui_info_bandrate_index = bandrate_index;
+                displayed_auto_state = auto_state;
             }
 
             if (ui_info_sd_unplugged != mon_is_sd_unplugged)
