@@ -1,304 +1,203 @@
 #include "strips.h"
-#include "avg.h"
+#include <atomic>
 
-struct trigger_info
-{
-    unsigned long last_ms;
-    unsigned long interval_ms;
-    bool is_busy;
-    uint8_t color;
+namespace {
+constexpr uint32_t FRAME_MS = STRIP_FRAME_INTERVAL_MS;
+constexpr uint8_t FADE_FRAMES = 6;
+constexpr uint8_t TAIL_FRAMES = 20;
+
+enum class EventKind : uint8_t { Rx, Tx, Off };
+struct StripEvent {
+    EventKind kind;
+    uint8_t hue;
+};
+struct Meteor {
+    bool active = false;
+    uint8_t hue = 0;
+    uint8_t fade_frame = 0;
+    uint8_t position = 1;
+    uint8_t tail_frame = 0;
 };
 
-bool is_run_strip_rx;
-bool is_run_strip_tx;
+QueueHandle_t event_queue = nullptr;
+CRGB leds_rx[NUM_LEDS];
+CRGB leds_tx[NUM_LEDS];
+std::atomic<uint32_t> show_started_ms{0};
+std::atomic<bool> showing{false};
+std::atomic<uint32_t> frames{0};
+std::atomic<uint32_t> dropped_events{0};
+std::atomic<uint32_t> rx_progress{0};
+std::atomic<uint32_t> tx_progress{0};
 
-static uint8_t strip_mode;
-
-static CRGB leds_rx[NUM_LEDS];
-static CRGB leds_tx[NUM_LEDS];
-
-static uint8_t led_index_rx;
-static bool is_fading_in_rx;
-static uint16_t fading_in_value_rx;
-static uint8_t led_update_interval_rx;
-
-static int8_t led_index_tx;
-static bool is_fading_in_tx;
-static uint16_t fading_in_value_tx;
-static uint8_t led_update_interval_tx;
-
-static struct trigger_info trigger_rx;
-static struct trigger_info trigger_tx;
-
-static movAvg3 avg_interval_rx;
-static movAvg3 avg_interval_tx;
-
-static uint8_t current_brightness;
-static uint8_t target_brightness;
-
-void turn_off_strips(void)
+TickType_t frame_ticks(uint32_t ms)
 {
-    FastLED.clear();
+    const TickType_t ticks = pdMS_TO_TICKS(ms);
+    return ticks > 0 ? ticks : 1;
+}
+
+void show_frame()
+{
+    show_started_ms.store(millis());
+    showing.store(true);
     FastLED.show();
+    frames.fetch_add(1);
+    showing.store(false);
 }
 
-static void effect_power_on(void)
+void post_event(EventKind kind, uint8_t hue = 0)
 {
-    FastLED.clear();
-    FastLED.show();
+    if (event_queue == nullptr || test_mode)
+        return;
+    const StripEvent event{kind, hue};
+    // Called from the UI task: LED output must never block data processing.
+    if (xQueueSend(event_queue, &event, 0) != pdTRUE)
+        dropped_events.fetch_add(1);
 }
 
-static void fadeToBlackBy2(CRGB *leds, int16_t num_leds, uint8_t fadeBy)
+void start_meteor(Meteor &meteor, uint8_t hue)
 {
-    for (uint16_t i = num_leds + 1; i < NUM_LEDS; ++i)
-    {
-        leds[i].nscale8(255 - fadeBy);
-    }
+    if (meteor.active)
+        return;
+    meteor = Meteor{};
+    meteor.active = true;
+    meteor.hue = hue;
 }
 
-static void task_strips_update_rx(void *pvParameters)
+void step_meteor(Meteor &meteor, CRGB *leds, bool reverse)
 {
-    for (;;)
-    {
-        if (is_run_strip_rx)
-        {
-            // effect: "Meteor"
-            if (is_fading_in_rx)
-            {
-                EVERY_N_MILLISECONDS(led_update_interval_rx)
-                {
-                    if (fading_in_value_rx > 5)
-                    {
-                        leds_rx[0] = CHSV(trigger_rx.color, 255, 255);
-                        led_index_rx = 1;
-                        is_fading_in_rx = false;
-                    }
-                    else
-                    {
-                        leds_rx[0] = CHSV(trigger_rx.color, 255, fading_in_value_rx * fading_in_value_rx * 7);
-                    }
-                    fading_in_value_rx++;
-                    FastLED.show();
-                }
-            }
-            else
-            {
-                if (led_index_rx < NUM_LEDS)
-                {
-                    leds_rx[led_index_rx] = CHSV(trigger_rx.color, 255, 255);
-                    fadeToBlackBy(leds_rx, led_index_rx, 80);
-                    led_index_rx++;
-                }
-                else
-                {
-                    fadeToBlackBy(leds_rx, led_index_rx, 80);
-                    if (leds_rx[NUM_LEDS - 1] == CRGB(0, 0, 0))
-                    {
-                        is_run_strip_rx = false;
-                        trigger_rx.is_busy = false;
-                    }
-                }
-                FastLED.show();
-            }
-
-            // // effect: "Ribbon"
-            // for (size_t i = NUM_LEDS; i > 1; i--)
-            // {
-            //     leds_rx[i - 1] = leds_rx[i - 2];
-            // }
-            // leds_rx[0] = CHSV(trigger_rx.color, 255, random(256));
-            // FastLED.show();
-            // is_run_strip_rx = false;
-            // trigger_rx.is_busy = false;
-
-            // // effect: "Noise"
-            // fadeToBlackBy(leds_rx, NUM_LEDS,255);
-            // leds_rx[random(NUM_LEDS-1)] = CHSV(trigger_rx.color, 255, 255);
-            // FastLED.show();
-            // is_run_strip_rx = false;
-            // trigger_rx.is_busy = false;
-        }
-        vTaskDelay(led_update_interval_rx);
-    }
-    vTaskDelete(NULL);
-}
-
-static void task_strips_update_tx(void *pvParameters)
-{
-    for (;;)
-    {
-        if (is_run_strip_tx)
-        {
-            if (is_fading_in_tx)
-            {
-                EVERY_N_MILLISECONDS(led_update_interval_tx)
-                {
-                    if (fading_in_value_tx > 5)
-                    {
-                        leds_tx[NUM_LEDS - 1] = CHSV(trigger_tx.color, 255, 255);
-                        led_index_tx = NUM_LEDS - 2;
-                        is_fading_in_tx = false;
-                    }
-                    else
-                    {
-                        leds_tx[NUM_LEDS - 1] = CHSV(trigger_tx.color, 255, fading_in_value_tx * fading_in_value_tx * 7);
-                    }
-                    fading_in_value_tx++;
-                    FastLED.show();
-                }
-            }
-            else
-            {
-                if (led_index_tx >= 0)
-                {
-                    leds_tx[led_index_tx] = CHSV(trigger_tx.color, 255, 255);
-                    fadeToBlackBy2(leds_tx, led_index_tx, 80);
-                    led_index_tx--;
-                }
-                else
-                {
-                    fadeToBlackBy2(leds_tx, led_index_tx, 80);
-                    if (leds_tx[0] == CRGB(0, 0, 0))
-                    {
-                        is_run_strip_tx = false;
-                        trigger_tx.is_busy = false;
-                    }
-                }
-                FastLED.show();
-            }
-        }
-        vTaskDelay(led_update_interval_tx);
-    }
-    vTaskDelete(NULL);
-}
-
-static void task_strips_update_brightness(void *pvParameters)
-{
-    for (;;)
-    {
-        target_brightness = map(mon_adc_light, 0, 4096, STRIP_BRIGHTNESS_MIN, STRIP_BRIGHTNESS_MAX);
-        if ((target_brightness > current_brightness + BRIGHTNESS_TOLERANCE) || (target_brightness < current_brightness - BRIGHTNESS_TOLERANCE))
-        {
-            while (1)
-            {
-                if (!is_run_strip_rx && !is_run_strip_tx)
-                {
-                    FastLED.setBrightness(target_brightness);
-                    current_brightness = target_brightness;
-                    log_i("strips brightness set to: %d", target_brightness);
-                    break;
-                }
-                vTaskDelay(10);
-            }
-        }
-        vTaskDelay(500);
-    }
-    vTaskDelete(NULL);
-}
-
-static void task_strips_test_mode(void *pvParameters)
-{
-    uint8_t rxHue = 0;
-    uint8_t txHue = 255;
-    for (;;)
-    {
-        rxHue++;
-        txHue--;
-        fill_rainbow(leds_rx, NUM_LEDS, rxHue, 7);
-        fill_rainbow(leds_tx, NUM_LEDS, txHue, 7);
-        FastLED.show();
-        vTaskDelay(40);
-    }
-    vTaskDelete(NULL);
-}
-
-void trigger_star_rx(uint32_t star_color)
-{
-    trigger_rx.interval_ms = millis() - trigger_rx.last_ms;
-    trigger_rx.last_ms = millis();
-
-    // 30 fps minimum
-    avg_interval_rx.push(trigger_rx.interval_ms / 30);
-    int32_t result = avg_interval_rx.result();
-
-    if (result > STRIP_TASK_DELAY_MAX)
-    {
-        led_update_interval_rx = STRIP_TASK_DELAY_MAX;
-    }
-    else if (result < STRIP_TASK_DELAY_MIN)
-    {
-        led_update_interval_rx = STRIP_TASK_DELAY_MIN;
-    }
-    else
-    {
-        led_update_interval_rx = result;
-    }
-
-    if (trigger_rx.is_busy)
+    if (!meteor.active)
         return;
 
-    trigger_rx.color = star_color >> 24;
-
-    // do not fade in the 1st led if interval was too short to increase the refresh speed of the stars
-    fading_in_value_rx = led_update_interval_rx >= FADE_IN_FIRST_DOT_THRESHOLD ? 0 : 255;
-    is_fading_in_rx = true;
-    is_run_strip_rx = true;
-    trigger_rx.is_busy = true;
+    fadeToBlackBy(leds, NUM_LEDS, 80);
+    if (meteor.fade_frame < FADE_FRAMES)
+    {
+        const uint8_t frame = ++meteor.fade_frame;
+        leds[reverse ? NUM_LEDS - 1 : 0] = CHSV(meteor.hue, 255, frame * frame * 7);
+    }
+    else if (meteor.position < NUM_LEDS)
+    {
+        const uint8_t index = reverse ? NUM_LEDS - 1 - meteor.position : meteor.position;
+        leds[index] = CHSV(meteor.hue, 255, 255);
+        ++meteor.position;
+    }
+    else if (++meteor.tail_frame >= TAIL_FRAMES)
+    {
+        fill_solid(leds, NUM_LEDS, CRGB::Black);
+        meteor.active = false;
+    }
 }
 
-void trigger_star_tx(uint32_t star_color)
+void task_strips(void *)
 {
-    trigger_tx.interval_ms = millis() - trigger_tx.last_ms;
-    trigger_tx.last_ms = millis();
+    // Register, initialize, and transmit from this one task on core 0.
+    // Test mode uses this exact same output path.
+    FastLED.addLeds<WS2812B, PIN_WS2812B_S1>(leds_rx, NUM_LEDS);
+    FastLED.addLeds<WS2812B, PIN_WS2812B_S2>(leds_tx, NUM_LEDS);
+    FastLED.setCorrection(TypicalLEDStrip);
+    uint8_t brightness = 20;
+    FastLED.setBrightness(brightness);
+    FastLED.clear();
+    show_frame();
 
-    // 30 fps minimum
-    avg_interval_tx.push(trigger_tx.interval_ms / 30);
-    int32_t result = avg_interval_tx.result();
-
-    if (result > STRIP_TASK_DELAY_MAX)
+    Meteor rx;
+    Meteor tx;
+    uint8_t hue = 0;
+    uint32_t last_brightness_ms = 0;
+    TickType_t last_wake = xTaskGetTickCount();
+    for (;;)
     {
-        led_update_interval_tx = STRIP_TASK_DELAY_MAX;
-    }
-    else if (result < STRIP_TASK_DELAY_MIN)
-    {
-        led_update_interval_tx = STRIP_TASK_DELAY_MIN;
-    }
-    else
-    {
-        led_update_interval_tx = result;
-    }
+        if (test_mode)
+        {
+            fill_rainbow(leds_rx, NUM_LEDS, ++hue, 7);
+            fill_rainbow(leds_tx, NUM_LEDS, 255 - hue, 7);
+        }
+        else
+        {
+            StripEvent event;
+            // Bound the amount of event work per frame under continuous traffic.
+            for (uint8_t i = 0; i < 16 && xQueueReceive(event_queue, &event, 0) == pdTRUE; ++i)
+            {
+                if (event.kind == EventKind::Off)
+                {
+                    rx = Meteor{};
+                    tx = Meteor{};
+                    FastLED.clear();
+                }
+                else if (event.kind == EventKind::Rx)
+                    start_meteor(rx, event.hue);
+                else
+                    start_meteor(tx, event.hue);
+            }
+            step_meteor(rx, leds_rx, false);
+            step_meteor(tx, leds_tx, true);
+            rx_progress.store(rx.active ? rx.fade_frame + rx.position + rx.tail_frame : 0);
+            tx_progress.store(tx.active ? tx.fade_frame + tx.position + tx.tail_frame : 0);
 
-    if (trigger_tx.is_busy)
-        return;
-
-    trigger_tx.color = star_color >> 24;
-
-    // do not fade in the 1st led if interval was too short to increase the refresh speed of the stars
-    fading_in_value_tx = led_update_interval_tx >= FADE_IN_FIRST_DOT_THRESHOLD ? 0 : 255;
-    is_fading_in_tx = true;
-    is_run_strip_tx = true;
-    trigger_tx.is_busy = true;
+            const uint32_t now = millis();
+            if (now - last_brightness_ms >= 500 && !rx.active && !tx.active)
+            {
+                const int target = constrain(map(mon_adc_light, 0, 4096,
+                                                 STRIP_BRIGHTNESS_MIN, STRIP_BRIGHTNESS_MAX),
+                                             STRIP_BRIGHTNESS_MIN, STRIP_BRIGHTNESS_MAX);
+                if (abs(target - brightness) > BRIGHTNESS_TOLERANCE)
+                {
+                    brightness = target;
+                    FastLED.setBrightness(brightness);
+                }
+                last_brightness_ms = now;
+            }
+        }
+        // Keep servicing the output driver even between UART packets.
+        show_frame();
+        vTaskDelayUntil(&last_wake, frame_ticks(FRAME_MS));
+    }
 }
+
+void task_strip_diagnostics(void *)
+{
+    uint8_t seconds = 0;
+    for (;;)
+    {
+        vTaskDelay(frame_ticks(1000));
+        if (showing.load())
+        {
+            const uint32_t elapsed = millis() - show_started_ms.load();
+            if (elapsed > 1000)
+                log_e("LED output stalled in FastLED.show(): %lu ms, frames=%lu, dropped=%lu",
+                      (unsigned long)elapsed, (unsigned long)frames.load(),
+                      (unsigned long)dropped_events.load());
+        }
+        if (++seconds == 10)
+        {
+            log_i("LED frames=%lu, RX step=%lu, TX step=%lu, dropped=%lu",
+                  (unsigned long)frames.load(), (unsigned long)rx_progress.load(),
+                  (unsigned long)tx_progress.load(), (unsigned long)dropped_events.load());
+            seconds = 0;
+        }
+    }
+}
+} // namespace
+
+void trigger_star_rx(uint32_t color) { post_event(EventKind::Rx, color >> 24); }
+void trigger_star_tx(uint32_t color) { post_event(EventKind::Tx, color >> 24); }
+void turn_off_strips(void) { post_event(EventKind::Off); }
 
 void strips_init(void)
 {
-    FastLED.addLeds<WS2812B, PIN_WS2812B_S1>(leds_rx, NUM_LEDS);
-    FastLED.addLeds<WS2812B, PIN_WS2812B_S2>(leds_tx, NUM_LEDS);
-    FastLED.setBrightness(20);
-    FastLED.setCorrection(TypicalLEDStrip);
-    if (test_mode)
+    event_queue = xQueueCreate(16, sizeof(StripEvent));
+    if (event_queue == nullptr)
     {
-        xTaskCreatePinnedToCore(task_strips_test_mode, "strips_update test mode", 8096, NULL, 1, NULL, 0);
+        log_e("failed to create LED event queue");
+        return;
     }
-    else
+    if (xTaskCreatePinnedToCore(task_strips, "strips", 8192, nullptr, 1, nullptr, 0) != pdPASS)
     {
-        effect_power_on();
-        led_update_interval_rx = STRIP_TASK_DELAY_MAX;
-        led_update_interval_tx = STRIP_TASK_DELAY_MAX;
-        is_run_strip_rx = false;
-        is_run_strip_tx = false;
-        xTaskCreatePinnedToCore(task_strips_update_rx, "strips_update rx", 8096, NULL, 8, NULL, 0);
-        xTaskCreatePinnedToCore(task_strips_update_tx, "strips_update tx", 8096, NULL, 7, NULL, 0);
-        xTaskCreatePinnedToCore(task_strips_update_brightness, "strips_update brightness", 8096, NULL, 7, NULL, 0);
+        log_e("failed to create LED output task");
+        vQueueDelete(event_queue);
+        event_queue = nullptr;
+        return;
     }
+    if (xTaskCreatePinnedToCore(task_strip_diagnostics, "strip diagnostics", 3072,
+                              nullptr, 1, nullptr, 1) != pdPASS)
+        log_e("failed to create LED diagnostics task");
 }
