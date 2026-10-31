@@ -34,6 +34,16 @@ class ReleaseChecks(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     release.version()
 
+    def test_draft_without_tag_is_found_in_release_list(self):
+        draft = {"id": 42, "tag_name": "v1.3.1", "draft": True}
+        with patch.object(release, "api_get", side_effect=[None, [draft]]) as get:
+            self.assertEqual(release.release_for_tag("owner/repo", "v1.3.1"), draft)
+            self.assertIn("releases?per_page=100", get.call_args.args[0])
+
+    def test_absent_release_returns_none(self):
+        with patch.object(release, "api_get", side_effect=[None, []]):
+            self.assertIsNone(release.release_for_tag("owner/repo", "v1.3.1"))
+
     def test_published_release_is_never_replaced(self):
         with patch.dict(os.environ, {"GITHUB_REPOSITORY": "owner/repo"}), \
              patch.object(release, "version", return_value="1.3.1"), \
@@ -48,7 +58,7 @@ class ReleaseChecks(unittest.TestCase):
         with patch.dict(os.environ, {"GITHUB_REPOSITORY": "owner/repo"}), \
              patch.object(release, "version", return_value="1.3.1"), \
              patch.object(release, "git", side_effect=["", "a" * 40]), \
-             patch.object(release, "api_get", side_effect=[None, {"object": {"type": "commit", "sha": "b" * 40}}]), \
+             patch.object(release, "api_get", side_effect=[None, [], {"object": {"type": "commit", "sha": "b" * 40}}]), \
              patch.object(release.subprocess, "run") as run:
             with self.assertRaises(ValueError):
                 release.publish()

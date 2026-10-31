@@ -128,6 +128,22 @@ def api_get(path):
         raise
 
 
+
+def release_for_tag(repo, tag):
+    release = api_get(f"repos/{repo}/releases/tags/{tag}")
+    if release is not None:
+        return release
+    # Drafts created before their tag exists are not returned by the tag endpoint.
+    for page in range(1, 11):
+        releases = api_get(f"repos/{repo}/releases?per_page=100&page={page}") or []
+        for candidate in releases:
+            if candidate["tag_name"] == tag:
+                return candidate
+        if len(releases) < 100:
+            return None
+    raise ValueError("Too many release pages to locate the draft safely")
+
+
 def publish():
     value = version()
     repo = os.environ["GITHUB_REPOSITORY"]
@@ -137,8 +153,7 @@ def publish():
         raise ValueError("Publish from a clean committed checkout")
     tag = "v" + value
     commit = git("rev-parse", "HEAD")
-    endpoint = f"repos/{repo}/releases/tags/{tag}"
-    release = api_get(endpoint)
+    release = release_for_tag(repo, tag)
     if release is not None and not release["draft"]:
         print(f"{tag} is already published; keeping the existing release and assets")
         return
@@ -172,7 +187,7 @@ def publish():
 
     # Check the server's asset digests before publishing the draft.
     for attempt in range(5):
-        remote = api_get(endpoint) or {"assets": []}
+        remote = release_for_tag(repo, tag) or {"assets": []}
         uploaded = {item["name"]: item for item in remote["assets"]}
         if all(path.name in uploaded and uploaded[path.name].get("digest") ==
                "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest() for path in assets):
