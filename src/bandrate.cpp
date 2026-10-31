@@ -78,6 +78,8 @@ void bandrate_init(void)
         // load previous bandrate from NVS
         preferences.begin("config", false);
         bandrate_index_in_nvs = preferences.getUChar("bandrate_id", BANDRATE_DEFAULT_ID);
+        if (bandrate_index_in_nvs < 1 || bandrate_index_in_nvs > 11)
+            bandrate_index_in_nvs = BANDRATE_DEFAULT_ID;
         bandrate_index = bandrate_index_in_nvs;
         preferences.end();
         log_i("default bandrate load from NVS: %d", bandrate_index_in_nvs);
@@ -102,7 +104,8 @@ void save_bandrate_to_nvs(void)
     {
         // save bandrate to NVS
         preferences.begin("config", false);
-        bandrate_index = preferences.putUChar("bandrate_id", bandrate_index);
+        preferences.putUChar("bandrate_id", bandrate_index);
+        bandrate_index_in_nvs = bandrate_index;
         preferences.end();
         log_i("current bandrate saved to NVS");
     }
