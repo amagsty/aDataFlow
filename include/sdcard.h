@@ -12,7 +12,6 @@
 #define CREATE_MAX_RETRY 10
 
 void sdcard_init(void);
-extern bool is_rec_status_changing;
 void rec(bool is_rx, char *s);
 void sdcard_toggle_rec(void);
 
