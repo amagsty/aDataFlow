@@ -5,7 +5,14 @@
 #include <LovyanGFX.hpp>
 #include <lvgl.h>
 #include <ArduinoJson.h>
+#if __has_include(<esp32/rom/crc.h>)
 #include <esp32/rom/crc.h>
+#elif __has_include(<esp32s3/rom/crc.h>)
+#include <esp32s3/rom/crc.h>
+#else
+#include <esp_rom_crc.h>
+#define crc32_le esp_rom_crc32_le
+#endif
 #include "main.h"
 #include "pins.h"
 #include "uart.h"
