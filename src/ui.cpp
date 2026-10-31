@@ -107,7 +107,6 @@ static struct chart_range chart_ranges[CHART_COUNT_MAX];
 static struct chart_series chart_series_prop;
 static uint16_t chart_point_count = CHART_WIDTH_PIXEL / 2;
 static uint32_t chart_palette[CHART_COUNT_MAX] = COLOR_CHART_PALETTE;
-static uint16_t chart_ser_index = 0;
 
 // ----------------------------------------
 // task and func
@@ -197,7 +196,9 @@ static void ui_update_chart_config(String &str_config)
         log_i("chart_bg set to: %u", chart_series_prop.bgcolor);
     }
 
-    JsonArray ser = doc_config["chart_series"].to<JsonArray>();
+    // This is an existing config array. `to<JsonArray>()` clears the value
+    // before converting it, which silently discarded all configured series.
+    JsonArray ser = doc_config["chart_series"].as<JsonArray>();
     uint8_t ser_index = 0;
     for (JsonObject s : ser)
     {
@@ -264,7 +265,6 @@ static void ui_update_chart_config(String &str_config)
         {
             lv_chart_set_all_value(ui_group_chart[i], ui_group_chart_series[i], LV_CHART_POINT_NONE);
             lv_chart_refresh(ui_group_chart[i]);
-            chart_ser_index = 0;
         }
         lv_obj_set_x(ui_cursorV, -20);
         ui_update_chart_color();
@@ -599,21 +599,9 @@ static void ui_task_update_main_screen(void *pvParameters)
                                         lv_label_set_text_fmt(ui_group_legend_val[i], chart_series_prop.value_fmt[i].c_str(), raw_value);
                                     }
 
-                                    // update the indicator line
-                                    lv_chart_get_point_pos_by_id(ui_group_chart[0], ui_group_chart_series[0], chart_ser_index, &p);
+                                    // In shift mode, each new sample appears at the right edge.
+                                    lv_chart_get_point_pos_by_id(ui_group_chart[0], ui_group_chart_series[0], chart_point_count - 1, &p);
                                     lv_obj_set_x(ui_cursorV, p.x + 14);
-                                    chart_ser_index++;
-                                    if (chart_ser_index >= chart_point_count)
-                                    {
-                                        chart_ser_index = 0;
-                                    }
-                                    else
-                                    {
-                                        for (size_t i = 0; i < chart_series_prop.series_count; i++)
-                                        {
-                                            lv_chart_set_value_by_id(ui_group_chart[i], ui_group_chart_series[i], chart_ser_index, LV_CHART_POINT_NONE);
-                                        }
-                                    }
 
                                     // display the legend
                                     if (ui_panWaiting_is_visible)
@@ -1225,6 +1213,7 @@ static void ui_draw_main_screen(void)
         lv_obj_set_align(ui_group_chart[i], LV_ALIGN_CENTER);
         lv_chart_set_type(ui_group_chart[i], LV_CHART_TYPE_LINE);
         lv_chart_set_point_count(ui_group_chart[i], chart_point_count);
+        lv_chart_set_all_value(ui_group_chart[i], ui_group_chart_series[i], LV_CHART_POINT_NONE);
         lv_chart_set_div_line_count(ui_group_chart[i], 0, 0);
         lv_chart_set_axis_tick(ui_group_chart[i], LV_CHART_AXIS_PRIMARY_X, 10, 5, 0, 0, false, 50);
         lv_chart_set_axis_tick(ui_group_chart[i], LV_CHART_AXIS_PRIMARY_Y, 10, 5, 0, 0, false, 50);
@@ -1238,7 +1227,7 @@ static void ui_draw_main_screen(void)
         lv_obj_set_style_pad_bottom(ui_group_chart[i], 1, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_line_width(ui_group_chart[i], 2, LV_PART_ITEMS | LV_STATE_DEFAULT);
         lv_obj_set_style_size(ui_group_chart[i], 0, LV_PART_INDICATOR | LV_STATE_DEFAULT);
-        lv_chart_set_update_mode(ui_group_chart[i], LV_CHART_UPDATE_MODE_CIRCULAR);
+        lv_chart_set_update_mode(ui_group_chart[i], LV_CHART_UPDATE_MODE_SHIFT);
     }
 
     ui_cursorV = lv_img_create(ui_panCharts);
