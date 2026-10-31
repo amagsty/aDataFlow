@@ -151,13 +151,25 @@ void turn_off_backlights(void)
 
 void save_bandrate_to_nvs(void)
 {
-    if (bandrate_index != bandrate_index_in_nvs)
+    const uint8_t selected_index = bandrate_index;
+    if (selected_index < 1 || selected_index > 11)
     {
-        // save bandrate to NVS
-        preferences.begin("config", false);
-        preferences.putUChar("bandrate_id", bandrate_index);
-        bandrate_index_in_nvs = bandrate_index;
-        preferences.end();
+        log_e("refusing to save invalid baud rate index");
+        return;
+    }
+    if (selected_index == bandrate_index_in_nvs)
+        return;
+    if (!preferences.begin("config", false))
+    {
+        log_e("failed to open baud rate settings");
+        return;
+    }
+    if (preferences.putUChar("bandrate_id", selected_index) == sizeof(selected_index))
+    {
+        bandrate_index_in_nvs = selected_index;
         log_i("current bandrate saved to NVS");
     }
+    else
+        log_e("failed to save baud rate index");
+    preferences.end();
 }
