@@ -49,7 +49,9 @@ static void enqueue_uart_line(uart_line_buffer_t *line, bool is_rx)
     if (line->length == 0)
         return;
 
-    uart_data_t q = {};
+    // Both callbacks hold uart_line_mutex. Keep this large copy off Arduino's
+    // small UART event-task stack; xQueueSend copies it before returning.
+    static uart_data_t q = {};
     memcpy(q.data_char, line->data, line->length);
     q.data_char[line->length] = '\0';
     q.data_len = line->length;
@@ -97,22 +99,25 @@ static void collect_uart_lines(HardwareSerial &serial, uart_line_buffer_t *line,
         }
         line->skip_lf = false;
 
+        if (is_line_end)
+        {
+            // The delimiter is separate from the payload budget. In particular,
+            // a full-size payload followed by CRLF must still be accepted.
+            line->data[line->length++] = c;
+            enqueue_uart_line(line, is_rx);
+            line->skip_lf = (c == '\r');
+            continue;
+        }
+
         if (line->length >= UART_LINE_MAX_LENGTH)
         {
             line->length = 0;
             line->dropping_overlong_line = true;
             log_w("UART line exceeded %u bytes; discarding until newline", (unsigned)UART_LINE_MAX_LENGTH);
-            if (is_line_end)
-                line->dropping_overlong_line = false;
             continue;
         }
 
         line->data[line->length++] = c;
-        if (is_line_end)
-        {
-            enqueue_uart_line(line, is_rx);
-            line->skip_lf = (c == '\r');
-        }
     }
 }
 
@@ -154,8 +159,10 @@ void uart_change_bandrate(uint32_t bandrate)
 
 void uart_init(void)
 {
-    // Lines are queued only after CR/LF framing, so fewer entries are needed.
-    uart_queue = xQueueCreate(128, sizeof(uart_data_t));
+    // Bound total queue memory even when the maximum payload size increases.
+    constexpr size_t queue_entries = UART_QUEUE_MEMORY_BUDGET / sizeof(uart_data_t);
+    static_assert(queue_entries > 0, "UART queue memory budget is too small");
+    uart_queue = xQueueCreate(queue_entries, sizeof(uart_data_t));
     uart_line_mutex = xSemaphoreCreateMutex();
     if (uart_queue == nullptr || uart_line_mutex == nullptr)
     {
