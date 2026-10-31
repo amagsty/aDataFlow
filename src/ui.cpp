@@ -432,9 +432,9 @@ static void ui_task_update_main_screen(void *pvParameters)
 {
     // common
     uart_data_t q;
-    bool is_new_data;
-    bool is_new_line;
-    bool is_end_with_new_line;
+    bool is_new_data = false;
+    bool is_new_line = true;
+    bool is_end_with_new_line = false;
     uint16_t pos_start;
     String current_str;
     bool cuurent_is_rx;
@@ -457,6 +457,12 @@ static void ui_task_update_main_screen(void *pvParameters)
             // check xQueue
             if (pdPASS == xQueueReceive(uart_queue, &q, 0))
             {
+                if (q.data_len == 0)
+                {
+                    vTaskDelay(UI_REFRESH_DELAY);
+                    continue;
+                }
+
                 is_new_data = true;
                 rec(q.is_rx, q.data_char);
 

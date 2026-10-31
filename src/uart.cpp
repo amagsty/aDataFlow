@@ -2,6 +2,8 @@
 #include "ui.h"
 #include "HardwareSerial.h"
 #include "driver/uart.h"
+#include "freertos/semphr.h"
+#include <string.h>
 
 // Define UART interrupts
 typedef enum
@@ -29,30 +31,104 @@ typedef enum
 } uart_intr_t;
 
 QueueHandle_t uart_queue;
+static SemaphoreHandle_t uart_line_mutex;
+
+typedef struct
+{
+    char data[UART_LINE_MAX_LENGTH + 1];
+    uint16_t length;
+    bool dropping_overlong_line;
+    bool skip_lf;
+} uart_line_buffer_t;
+
+static uart_line_buffer_t rx_line_buffer = {};
+static uart_line_buffer_t tx_line_buffer = {};
+
+static void enqueue_uart_line(uart_line_buffer_t *line, bool is_rx)
+{
+    if (line->length == 0)
+        return;
+
+    uart_data_t q = {};
+    memcpy(q.data_char, line->data, line->length);
+    q.data_char[line->length] = '\0';
+    q.data_len = line->length;
+    q.is_rx = is_rx;
+
+    if (xQueueSend(uart_queue, &q, 0) != pdPASS)
+    {
+        log_w("UART line queue full; line dropped");
+    }
+    line->length = 0;
+}
+
+static void collect_uart_lines(HardwareSerial &serial, uart_line_buffer_t *line, bool is_rx)
+{
+    while (serial.available() > 0)
+    {
+        int value = serial.read();
+        if (value < 0)
+            break;
+
+        char c = static_cast<char>(value);
+        bool is_line_end = (c == '\r' || c == '\n');
+
+        if (line->dropping_overlong_line)
+        {
+            if (is_line_end)
+            {
+                line->dropping_overlong_line = false;
+                line->length = 0;
+                line->skip_lf = (c == '\r');
+            }
+            continue;
+        }
+
+        if (line->skip_lf && c == '\n')
+        {
+            line->skip_lf = false;
+            continue;
+        }
+        line->skip_lf = false;
+
+        if (line->length >= UART_LINE_MAX_LENGTH)
+        {
+            line->length = 0;
+            line->dropping_overlong_line = true;
+            log_w("UART line exceeded %u bytes; discarding until newline", (unsigned)UART_LINE_MAX_LENGTH);
+            if (is_line_end)
+                line->dropping_overlong_line = false;
+            continue;
+        }
+
+        line->data[line->length++] = c;
+        if (is_line_end)
+        {
+            enqueue_uart_line(line, is_rx);
+            line->skip_lf = (c == '\r');
+        }
+    }
+}
 
 void onReceive_rx_cb()
 {
-    uart_data_t q;
-    size_t available = Serial1.available();
-    Serial1.readBytes(q.data_char, available);
-    q.data_char[available] = 0; // Add the terminating nul char
-    q.data_len = available;
-    q.is_rx = true;
-    xQueueSend(uart_queue, (void *)&q, 0); // do not block this task
+    xSemaphoreTake(uart_line_mutex, portMAX_DELAY);
+    collect_uart_lines(Serial1, &rx_line_buffer, true);
+    xSemaphoreGive(uart_line_mutex);
 }
+
 void onReceive_tx_cb()
 {
-    uart_data_t q;
-    size_t available = Serial2.available();
-    Serial2.readBytes(q.data_char, available);
-    q.data_char[available] = 0; // Add the terminating nul char
-    q.data_len = available;
-    q.is_rx = false;
-    xQueueSend(uart_queue, (void *)&q, 0); // do not block this task
+    xSemaphoreTake(uart_line_mutex, portMAX_DELAY);
+    collect_uart_lines(Serial2, &tx_line_buffer, false);
+    xSemaphoreGive(uart_line_mutex);
 }
 
 void uart_change_bandrate(uint32_t bandrate)
 {
+    if (uart_line_mutex == nullptr)
+        return;
+    xSemaphoreTake(uart_line_mutex, portMAX_DELAY);
     Serial1.flush();
     delay(UART_WAIT);
     Serial2.flush();
@@ -61,12 +137,25 @@ void uart_change_bandrate(uint32_t bandrate)
     delay(UART_WAIT);
     Serial2.updateBaudRate(bandrate);
     delay(UART_WAIT);
+    uart_flush_input(UART_NUM_1);
+    uart_flush_input(UART_NUM_2);
+    rx_line_buffer = {};
+    tx_line_buffer = {};
+    xQueueReset(uart_queue);
+    xSemaphoreGive(uart_line_mutex);
     log_i("bandrate updated to: %d", bandrate);
 }
 
 void uart_init(void)
 {
-    uart_queue = xQueueCreate(500, sizeof(uart_data_t));
+    // Lines are queued only after CR/LF framing, so fewer entries are needed.
+    uart_queue = xQueueCreate(128, sizeof(uart_data_t));
+    uart_line_mutex = xSemaphoreCreateMutex();
+    if (uart_queue == nullptr || uart_line_mutex == nullptr)
+    {
+        log_e("failed to allocate UART line queue or mutex");
+        return;
+    }
     
     Serial1.setTimeout(UART_TIMEOUT);
     Serial2.setTimeout(UART_TIMEOUT);
