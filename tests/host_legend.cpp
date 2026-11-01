@@ -550,6 +550,13 @@ int main()
     check_terminal_history();
     check_wrapped_hex_rendering();
     check_network_indicator();
+    // LVGL 8 removes the display objects but leaves the driver-owned draw
+    // context to its caller. Release both before Linux LeakSanitizer runs.
+    lv_disp_remove(lv_disp_get_default());
+    if (driver.draw_ctx_deinit) driver.draw_ctx_deinit(&driver, driver.draw_ctx);
+    lv_mem_free(driver.draw_ctx);
+    driver.draw_ctx = nullptr;
+    assert(terminal_allocations.empty());
     std::cout << "PASS: compact Wi-Fi icon and provisioning/connecting/online/offline corner transitions without page switching\n";
     std::cout << "PASS: real LVGL layout, uniform row fonts, centered columns, 1-5 channels, negative signs and wide-number fallback\n";
     std::cout << "PASS: actual five-channel chart stream, 5000 samples, missing/overflow values, time labels and repeated visibility changes under ASan\n";
