@@ -28,6 +28,7 @@ def main():
     baud = (ROOT / "src/bandrate.cpp").read_text()
     recording = (ROOT / "src/sdcard.cpp").read_text()
     uart = (ROOT / "src/uart.cpp").read_text()
+    network = (ROOT / "src/network_time.cpp").read_text()
     uart_header = (ROOT / "include/uart.h").read_text()
     with tempfile.TemporaryDirectory(prefix="adataflow-host-") as temp:
         temp = Path(temp)
@@ -42,7 +43,10 @@ def main():
         (temp / "recording_functions.inc").write_text(recording_functions)
         (temp / "uart_types.inc").write_text(section(uart_header, "#define UART_LINE_MAX_LENGTH", "extern QueueHandle_t"))
         (temp / "uart_functions.inc").write_text(section(uart, "typedef struct\n{\n    char data", "void onReceive_rx_cb()"))
-        for name in ("host_safety", "host_recording", "host_uart"):
+        (temp / "network_functions.inc").write_text(section(network, "// All radio operations", "static void network_task("))
+        wrapper = (ROOT / "src/smartconfig_task_stack.cpp").read_text()
+        (temp / "task_stack_wrapper.inc").write_text(wrapper[wrapper.index('extern "C"'):])
+        for name in ("host_safety", "host_recording", "host_uart", "host_network", "host_task_stack"):
             executable = temp / name
             command = [compiler, "-std=c++17", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
                        "-I" + str(temp), "-I" + str(ROOT / "include"), "-I" + str(json_headers),

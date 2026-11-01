@@ -59,6 +59,7 @@ struct PreferencesStub {
 } preferences;
 uint8_t bandrate_index = 7, bandrate_index_in_nvs = 7;
 
+void ui_reset_chart_timeline() {}
 #include "ui_functions.inc"
 
 static void config(const char *json)

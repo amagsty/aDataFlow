@@ -1,5 +1,7 @@
 #include "lvgl.h"
 #include <ArduinoJson.h>
+#include "chart_timeline.h"
+#include "network_time.h"
 #include "chart_validation.h"
 #include <ctime>
 #include <cassert>
@@ -76,7 +78,62 @@ static uint32_t millis() { return terminal_test_ms; }
 #define free terminal_free
 #include "terminal_helpers.inc"
 #undef free
+#include "clock_helpers.inc"
+#include "plot_helpers.inc"
 #include "terminal_events.inc"
+
+static lv_obj_t *ui_lblNetwork = nullptr, *ui_lblNetworkStatus = nullptr;
+static lv_obj_t *ui_panInfo = nullptr;
+static NetworkState test_network_state = NetworkState::Unconfigured;
+NetworkState network_state() { return test_network_state; }
+constexpr int COLOR_INFO_TEXT = 0xFFFef7;
+#include "network_indicator.inc"
+
+static void check_network_indicator()
+{
+    // Real widgets and partial redraws, without changing pages or forcing a full refresh.
+    ui_panInfo = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(ui_panInfo);
+    lv_obj_set_size(ui_panInfo, 320, 27);
+    lv_obj_set_style_bg_color(ui_panInfo, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(ui_panInfo, LV_OPA_COVER, LV_PART_MAIN);
+#include "network_creation.inc"
+    lv_obj_update_layout(ui_panInfo);
+    auto *slot = lv_obj_get_parent(ui_lblNetwork);
+    assert(lv_obj_get_width(slot) == 18 && lv_obj_get_height(slot) == 18);
+    assert(lv_obj_get_style_text_font(ui_lblNetwork, LV_PART_MAIN) == &lv_font_montserrat_12);
+    assert(lv_obj_get_style_text_font(ui_lblNetworkStatus, LV_PART_MAIN) == &lv_font_montserrat_8);
+    auto snapshot = [&]() {
+        lv_area_t area;
+        lv_obj_get_coords(slot, &area);
+        std::vector<unsigned char> pixels;
+        for (int y = area.y1; y <= area.y2; ++y)
+            for (int x = area.x1; x <= area.x2; ++x)
+                for (int c = 0; c < 3; ++c)
+                    pixels.push_back(preview_pixels[(y * 320 + x) * 3 + c]);
+        return pixels;
+    };
+    test_network_state = NetworkState::Online;
+    ui_update_network_indicator();
+    lv_refr_now(nullptr);
+    const auto online_pixels = snapshot();
+    for (const auto status : {NetworkState::Provisioning, NetworkState::Connecting,
+                              NetworkState::Online, NetworkState::Failed, NetworkState::Online})
+    {
+        test_network_state = status;
+        ui_update_network_indicator();
+        lv_refr_now(nullptr);
+        const char *expected = status == NetworkState::Online ? "" :
+            status == NetworkState::Provisioning ? "?" :
+            status == NetworkState::Connecting ? "..." : "x";
+        assert(std::string(lv_label_get_text(ui_lblNetworkStatus)) == expected);
+        if (status == NetworkState::Online) assert(snapshot() == online_pixels);
+        else assert(snapshot() != online_pixels);
+    }
+    lv_obj_del(ui_panInfo);
+    ui_panInfo = ui_lblNetwork = ui_lblNetworkStatus = nullptr;
+    ui_update_network_indicator(); // Test mode has no network widgets.
+}
 
 static std::string terminal_visible_text(lv_obj_t *label)
 {
@@ -308,6 +365,7 @@ static void create_actual_legend()
     lv_obj_set_size(ui_panCharts, 300, 150);
     lv_obj_set_style_pad_all(ui_panCharts, 0, LV_PART_MAIN);
     lv_obj_set_style_border_width(ui_panCharts, 0, LV_PART_MAIN);
+#include "clock_creation.inc"
 #include "legend_creation.inc"
 }
 
@@ -369,6 +427,55 @@ static void assert_uniform_layout(unsigned count)
     }
 }
 
+static void check_plot_stream()
+{
+    lv_obj_clear_flag(ui_panContainerChart, LV_OBJ_FLAG_HIDDEN);
+    const char *names[] = {"ecg", "pressure", "response", "steps", "jitter"};
+    chart_series_prop.series_count = CHART_COUNT_MAX;
+    for (unsigned i = 0; i < CHART_COUNT_MAX; ++i)
+    {
+        chart_series_prop.sername[i] = names[i];
+        chart_series_prop.value_fmt[i] = i == 0 ? "%.2f" : "%.1f";
+        chart_ranges[i] = {};
+        ui_group_chart[i] = lv_chart_create(ui_panCharts);
+        lv_obj_set_size(ui_group_chart[i], 274, 124);
+        lv_obj_align(ui_group_chart[i], LV_ALIGN_CENTER, 0, 0);
+        lv_chart_set_point_count(ui_group_chart[i], chart_point_count);
+        lv_chart_set_update_mode(ui_group_chart[i], LV_CHART_UPDATE_MODE_SHIFT);
+        lv_obj_set_style_bg_opa(ui_group_chart[i], LV_OPA_TRANSP, LV_PART_MAIN);
+        ui_group_chart_series[i] = lv_chart_add_series(ui_group_chart[i], lv_palette_main(LV_PALETTE_BLUE), LV_CHART_AXIS_PRIMARY_Y);
+    }
+    ui_cursorV = lv_obj_create(ui_panCharts);
+    lv_obj_set_size(ui_cursorV, 2, 124);
+    ui_update_legend_layout();
+    ui_reset_chart_timeline();
+    for (unsigned sample = 0; sample < 5000; ++sample)
+    {
+        JsonDocument doc;
+        doc["ecg"] = (int(sample % 201) - 100) / 100.0;
+        doc["pressure"] = 50 + (sample % 601) / 10.0;
+        doc["response"] = (sample % 1001) / 10.0;
+        doc["steps"] = (sample % 64) / 8 * (100.0 / 7);
+        doc["jitter"] = (int(sample % 161) - 80) / 10.0;
+        if (sample % 19 == 0) doc.remove("jitter");
+        if (sample % 23 == 0) doc["response"] = "missing";
+        if (sample % 97 == 0) doc["ecg"] = 1e300;
+        ui_plot_sample(doc, uint64_t(sample) * 300000);
+        if (sample % 8 == 0) lv_refr_now(nullptr);
+        if (sample % 512 == 0)
+        {
+            lv_obj_add_flag(ui_panContainerChart, LV_OBJ_FLAG_HIDDEN);
+            lv_refr_now(nullptr);
+            lv_obj_clear_flag(ui_panContainerChart, LV_OBJ_FLAG_HIDDEN);
+            ui_update_legend_layout();
+        }
+    }
+    lv_refr_now(nullptr);
+    assert(chart_timeline.span_us() == uint64_t(chart_point_count - 1) * 300000);
+    assert(!lv_obj_has_flag(ui_lblChartTimestamp, LV_OBJ_FLAG_HIDDEN));
+    assert_uniform_layout(5);
+}
+
 int main()
 {
     lv_init();
@@ -415,9 +522,37 @@ int main()
     lv_obj_update_layout(ui_panSeries);
     assert_fits(0, "--");
     assert_uniform_layout(5);
+    ui_reset_chart_timeline();
+    assert(lv_obj_has_flag(ui_lblChartTimestamp, LV_OBJ_FLAG_HIDDEN));
+    chart_timeline.push(0, 0);
+    chart_timeline.push(390000000, 0);
+    ui_update_chart_time_labels();
+    assert(std::string(lv_label_get_text(ui_lblChartSpan)) == "-6.5min");
+    assert(lv_obj_has_flag(ui_lblChartTimestamp, LV_OBJ_FLAG_HIDDEN));
+    test_epoch_base = 1704067200000000LL;
+    ui_update_chart_time_labels();
+    assert(std::string(lv_label_get_text(ui_lblChartTimestamp)) == "08:06:30");
+    assert(!lv_obj_has_flag(ui_lblChartTimestamp, LV_OBJ_FLAG_HIDDEN));
+    test_epoch_base += 10000000;
+    ui_update_chart_time_labels();
+    assert(std::string(lv_label_get_text(ui_lblChartTimestamp)) == "08:06:30");
+    lv_obj_update_layout(ui_panCharts);
+    lv_area_t chart_area, left, right;
+    lv_obj_get_coords(ui_panCharts, &chart_area);
+    lv_obj_get_coords(ui_lblChartSpan, &left);
+    lv_obj_get_coords(ui_lblChartTimestamp, &right);
+    assert(left.x1 >= chart_area.x1 && right.x2 <= chart_area.x2);
+    assert(left.x2 < right.x1 && left.y2 == right.y2 && right.y2 < chart_area.y2);
+    ui_reset_chart_timeline();
+    assert(std::string(lv_label_get_text(ui_lblChartSpan)) == "--");
+    assert(lv_obj_has_flag(ui_lblChartTimestamp, LV_OBJ_FLAG_HIDDEN));
+    check_plot_stream();
     check_terminal_history();
     check_wrapped_hex_rendering();
+    check_network_indicator();
+    std::cout << "PASS: compact Wi-Fi icon and provisioning/connecting/online/offline corner transitions without page switching\n";
     std::cout << "PASS: real LVGL layout, uniform row fonts, centered columns, 1-5 channels, negative signs and wide-number fallback\n";
+    std::cout << "PASS: actual five-channel chart stream, 5000 samples, missing/overflow values, time labels and repeated visibility changes under ASan\n";
     std::cout << "PASS: plain HEX bytes, direct alternating colors across wrapped/scrolled RX/TX lines, no markup glyphs\n";
     std::cout << "PASS: terminal history, ASCII/HEX cached redraw, long/short press separation, 2048-byte rows, bounded preview and row cleanup\n";
 }

@@ -1,6 +1,8 @@
 
 #include "bandrate.h"
 #include "autobaud.h"
+#include "hold_button.h"
+#include "network_time.h"
 
 ShiftRegister74HC595<2> sr(PIN_74HC595_DS, PIN_74HC595_SHCP, PIN_74HC595_STCP);
 
@@ -19,9 +21,13 @@ Preferences preferences;
 
 static void task_update_bandrate(void *pvParameters)
 {
+    HoldButton button(5000);
     for (;;)
     {
-        if (hw_enc_bandrate.isEncoderButtonClicked())
+        const auto action = button.update(hw_enc_bandrate.isEncoderButtonDown(), millis());
+        if (action == HoldButton::Event::Long)
+            network_request_provisioning();
+        if (action == HoldButton::Event::Short)
         {
             is_bandrate_changed = false;
             if (bandrate_auto_state == AutoBaudState::Measuring)

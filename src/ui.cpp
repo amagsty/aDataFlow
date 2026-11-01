@@ -1,5 +1,8 @@
 #include "ui.h"
 #include "chart_validation.h"
+#include "chart_timeline.h"
+#include "network_time.h"
+#include <time.h>
 #include <stdio.h>
 #include <esp_heap_caps.h>
 
@@ -40,6 +43,10 @@ static lv_obj_t *ui_cursorV;
 static lv_obj_t *ui_panWaiting;
 static lv_obj_t *ui_lblWaiting;
 static lv_obj_t *ui_lblQString;
+static lv_obj_t *ui_lblChartSpan;
+static lv_obj_t *ui_lblChartTimestamp;
+static lv_obj_t *ui_lblNetwork;
+static lv_obj_t *ui_lblNetworkStatus;
 static lv_obj_t *ui_panSeries;
 static lv_obj_t *ui_group_chart[CHART_COUNT_MAX];
 static lv_chart_series_t *ui_group_chart_series[CHART_COUNT_MAX];
@@ -115,6 +122,40 @@ static uint32_t chart_palette[CHART_COUNT_MAX] = COLOR_CHART_PALETTE;
 // ----------------------------------------
 // task and func
 // ----------------------------------------
+static ChartTimeline<CHART_WIDTH_PIXEL / 2> chart_timeline;
+
+static void ui_update_chart_time_labels()
+{
+    if (ui_lblChartSpan == nullptr || ui_lblChartTimestamp == nullptr) return;
+    char span[48] = "--";
+    if (!chart_timeline.empty())
+        format_chart_span(span, sizeof(span), chart_timeline.span_us());
+    if (strcmp(lv_label_get_text(ui_lblChartSpan), span) != 0)
+        lv_label_set_text(ui_lblChartSpan, span);
+    if (!chart_timeline.empty() && chart_timeline.latest_epoch_us == 0)
+        chart_timeline.latest_epoch_us = network_epoch_us(chart_timeline.latest());
+    if (chart_timeline.empty() || chart_timeline.latest_epoch_us == 0)
+        lv_obj_add_flag(ui_lblChartTimestamp, LV_OBJ_FLAG_HIDDEN);
+    else
+    {
+        // Freeze the last sample's wall time, including during later NTP corrections.
+        const time_t seconds = chart_timeline.latest_epoch_us / 1000000 + 8 * 3600;
+        struct tm local{};
+        gmtime_r(&seconds, &local);
+        char text[16];
+        strftime(text, sizeof(text), "%H:%M:%S", &local);
+        if (strcmp(lv_label_get_text(ui_lblChartTimestamp), text) != 0)
+            lv_label_set_text(ui_lblChartTimestamp, text);
+        lv_obj_clear_flag(ui_lblChartTimestamp, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void ui_reset_chart_timeline()
+{
+    chart_timeline.clear();
+    ui_update_chart_time_labels();
+}
+
 static char ui_legend_value_text[CHART_COUNT_MAX][48];
 
 static const lv_font_t *ui_fit_legend_font(bool captions)
@@ -156,13 +197,13 @@ static void ui_refresh_legend_values()
     }
 }
 
-static void ui_set_legend_text(size_t index, const char *text)
+static void ui_set_legend_text(size_t index, const char *text, bool refresh = true)
 {
     snprintf(ui_legend_value_text[index], sizeof(ui_legend_value_text[index]), "%s", text);
-    ui_refresh_legend_values();
+    if (refresh) ui_refresh_legend_values();
 }
 
-static void ui_set_legend_number(size_t index, double value)
+static void ui_set_legend_number(size_t index, double value, bool refresh = true)
 {
     char text[48];
     snprintf(text, sizeof(text), chart_series_prop.value_fmt[index].c_str(), value);
@@ -171,7 +212,7 @@ static void ui_set_legend_number(size_t index, double value)
     if (lv_txt_get_width(text, strlen(text), &ui_font_SFMono_9, spacing, LV_TEXT_FLAG_NONE) >
         lv_obj_get_content_width(label))
         snprintf(text, sizeof(text), "%.2e", value);
-    ui_set_legend_text(index, text);
+    ui_set_legend_text(index, text, refresh);
 }
 
 static void ui_update_legend_layout()
@@ -316,6 +357,7 @@ static void ui_update_chart_config(JsonDocument &config)
         chart_series_prop.series_count = index;
         is_prepare_sername_needed = true;
         is_reset_chart_color_needed = true;
+        ui_reset_chart_timeline();
         for (size_t i = 0; i < CHART_COUNT_MAX; ++i)
             lv_chart_set_all_value(ui_group_chart[i], ui_group_chart_series[i], LV_CHART_POINT_NONE);
         lv_obj_set_x(ui_cursorV, -20);
@@ -343,6 +385,8 @@ static void ui_task_update_topbar(void *pvParameters)
                 ui_info_bandrate_index = bandrate_index;
                 displayed_auto_state = auto_state;
             }
+
+            ui_update_chart_time_labels();
 
             if (ui_info_sd_unplugged != mon_is_sd_unplugged)
             {
@@ -669,10 +713,49 @@ static void ui_star_shoot(bool is_rx, char *data)
     }
 }
 
+static void ui_plot_sample(JsonDocument &doc, uint64_t received_us)
+{
+    static uint32_t samples = 0;
+    const bool trace = ++samples <= 3 || samples % 32 == 0;
+    if (trace)
+        log_i("CHART begin: sample=%lu, heap=%lu, largest=%lu, stack_free=%lu",
+              (unsigned long)samples,
+              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+              (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+              (unsigned long)uxTaskGetStackHighWaterMark(nullptr));
+    for (size_t i = 0; i < chart_series_prop.series_count; ++i)
+    {
+        JsonVariantConst value = doc[chart_series_prop.sername[i]];
+        int32_t coordinate;
+        if (!value.is<double>() ||
+            !chart_validation::scale_value(value.as<double>(), chart_ranges[i].value_scale, coordinate))
+        {
+            lv_chart_set_next_value(ui_group_chart[i], ui_group_chart_series[i], LV_CHART_POINT_NONE);
+            ui_set_legend_text(i, "--", false);
+            continue;
+        }
+        ui_update_chart_range(ui_group_chart[i], &chart_ranges[i], coordinate);
+        lv_chart_set_next_value(ui_group_chart[i], ui_group_chart_series[i], coordinate);
+        ui_set_legend_number(i, value.as<double>(), false);
+    }
+    // Pick and apply one common value font after all channels have been formatted.
+    ui_refresh_legend_values();
+    if (trace) log_i("CHART values updated");
+    chart_timeline.push(received_us, network_epoch_us(received_us));
+    ui_update_chart_time_labels();
+    const lv_coord_t right_edge = lv_obj_get_content_width(ui_group_chart[0]) +
+        lv_obj_get_style_pad_left(ui_group_chart[0], LV_PART_MAIN) +
+        lv_obj_get_style_border_width(ui_group_chart[0], LV_PART_MAIN);
+    lv_obj_set_x(ui_cursorV, right_edge + 14);
+    if (trace)
+        log_i("CHART end: stack_free=%lu", (unsigned long)uxTaskGetStackHighWaterMark(nullptr));
+}
+
 static void ui_task_update_main_screen(void *pvParameters)
 {
     // common
     uart_data_t q;
+    unsigned startup_packet_logs = 0;
     bool is_new_data = false;
     bool is_new_line = true;
     bool is_end_with_new_line = false;
@@ -701,6 +784,12 @@ static void ui_task_update_main_screen(void *pvParameters)
                     continue;
                 }
 
+                const bool trace_startup_packet = startup_packet_logs++ < 3;
+                if (trace_startup_packet)
+                    log_i("UART startup line: length=%u, internal_heap=%lu, stack_free=%lu",
+                          unsigned(q.data_len),
+                          (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                          (unsigned long)uxTaskGetStackHighWaterMark(nullptr));
                 is_new_data = true;
                 rec(q.is_rx, q.data_char);
 
@@ -708,6 +797,7 @@ static void ui_task_update_main_screen(void *pvParameters)
                 {
                     // Capture raw bytes before strtok mutates the queue buffer.
                     ui_record_terminal_line(q.is_rx, q.data_char, q.data_len);
+                    if (trace_startup_packet) log_i("UART startup: history appended");
 
                     // header and footer of data_char check
                     if (q.data_char[0] == 10 || q.data_char[0] == 13)
@@ -740,6 +830,9 @@ static void ui_task_update_main_screen(void *pvParameters)
                             const bool is_config_line = !error && doc.is<JsonObject>() && !doc["config"].isNull();
                             if (is_config_line)
                                 ui_update_chart_config(doc);
+                            if (trace_startup_packet)
+                                log_i("UART startup: JSON error=%d, config=%d, chart=%d",
+                                      int(error.code()), int(is_config_line), int(is_chart));
 
                             // update ui
                             if (is_chart)
@@ -794,28 +887,7 @@ static void ui_task_update_main_screen(void *pvParameters)
                                     }
                                     else
                                     {
-                                        // update chart
-                                        for (size_t i = 0; i < chart_series_prop.series_count; i++)
-                                        {
-                                            JsonVariantConst value = doc[chart_series_prop.sername[i]];
-                                            int32_t coordinate;
-                                            if (!value.is<double>() ||
-                                                !chart_validation::scale_value(value.as<double>(), chart_ranges[i].value_scale, coordinate))
-                                            {
-                                                lv_chart_set_next_value(ui_group_chart[i], ui_group_chart_series[i], LV_CHART_POINT_NONE);
-                                                ui_set_legend_text(i, "--");
-                                                continue;
-                                            }
-                                            ui_update_chart_range(ui_group_chart[i], &chart_ranges[i], coordinate);
-                                            lv_chart_set_next_value(ui_group_chart[i], ui_group_chart_series[i], coordinate);
-                                            ui_set_legend_number(i, value.as<double>());
-                                        }
-
-                                        // In shift mode, each new sample appears at the right edge.
-                                        const lv_coord_t right_edge = lv_obj_get_content_width(ui_group_chart[0]) +
-                                            lv_obj_get_style_pad_left(ui_group_chart[0], LV_PART_MAIN) +
-                                            lv_obj_get_style_border_width(ui_group_chart[0], LV_PART_MAIN);
-                                        lv_obj_set_x(ui_cursorV, right_edge + 14);
+                                        ui_plot_sample(doc, q.received_us);
 
                                         // display the legend
                                         if (ui_panWaiting_is_visible)
@@ -846,6 +918,9 @@ static void ui_task_update_main_screen(void *pvParameters)
                         is_new_line = true;
                     }
                     is_new_line = is_end_with_new_line;
+                    if (trace_startup_packet)
+                        log_i("UART startup: line complete, stack_free=%lu",
+                              (unsigned long)uxTaskGetStackHighWaterMark(nullptr));
                     xSemaphoreGive(lvgl_mutex);
                 }
             }
@@ -1129,12 +1204,28 @@ static bool lv_port_init(void)
     return true;
 }
 
+// Called by the render task with lvgl_mutex held, independently of page/data load.
+static void ui_update_network_indicator()
+{
+    if (ui_lblNetwork == nullptr || ui_lblNetworkStatus == nullptr) return;
+    const auto status = network_state();
+    const char *mark = status == NetworkState::Online ? "" :
+        status == NetworkState::Provisioning ? "?" :
+        status == NetworkState::Connecting ? "..." : "x";
+    if (strcmp(lv_label_get_text(ui_lblNetworkStatus), mark) == 0) return;
+    lv_label_set_text_static(ui_lblNetworkStatus, mark);
+    // Clearing the corner marker shrinks its label. Repaint the fixed parent
+    // area as well so the former glyphs are erased on a busy chart screen.
+    lv_obj_invalidate(lv_obj_get_parent(ui_lblNetworkStatus));
+}
+
 static void lv_task_timer(void *pvParameters)
 {
     for (;;)
     {
         if (pdTRUE == xSemaphoreTake(lvgl_mutex, portMAX_DELAY))
         {
+            ui_update_network_indicator();
             lv_timer_handler();
             xSemaphoreGive(lvgl_mutex);
         }
@@ -1279,10 +1370,27 @@ static void ui_draw_main_screen(void)
     lv_obj_set_style_pad_top(ui_panInfo, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_pad_bottom(ui_panInfo, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
 
+    // One compact indicator, centered with the baud-rate text.
+    lv_obj_t *network_slot = lv_obj_create(ui_panInfo);
+    lv_obj_remove_style_all(network_slot);
+    lv_obj_set_size(network_slot, 18, 18);
+    lv_obj_align(network_slot, LV_ALIGN_LEFT_MID, 0, 1);
+    lv_obj_clear_flag(network_slot, LV_OBJ_FLAG_SCROLLABLE);
+    ui_lblNetwork = lv_label_create(network_slot);
+    lv_label_set_text(ui_lblNetwork, LV_SYMBOL_WIFI);
+    lv_obj_set_style_text_font(ui_lblNetwork, &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(ui_lblNetwork, lv_color_hex(COLOR_INFO_TEXT), LV_PART_MAIN);
+    lv_obj_align(ui_lblNetwork, LV_ALIGN_LEFT_MID, 0, -1);
+    ui_lblNetworkStatus = lv_label_create(network_slot);
+    lv_label_set_text(ui_lblNetworkStatus, "x");
+    lv_obj_set_style_text_font(ui_lblNetworkStatus, &lv_font_montserrat_8, LV_PART_MAIN);
+    lv_obj_set_style_text_color(ui_lblNetworkStatus, lv_color_hex(COLOR_INFO_TEXT), LV_PART_MAIN);
+    lv_obj_align(ui_lblNetworkStatus, LV_ALIGN_BOTTOM_RIGHT, -1, 0);
+
     ui_lblBandrate = lv_label_create(ui_panInfo);
     lv_obj_set_width(ui_lblBandrate, LV_SIZE_CONTENT);  /// 1
     lv_obj_set_height(ui_lblBandrate, LV_SIZE_CONTENT); /// 1
-    lv_obj_set_x(ui_lblBandrate, 0);
+    lv_obj_set_x(ui_lblBandrate, 24);
     lv_obj_set_y(ui_lblBandrate, 0);
     lv_obj_set_align(ui_lblBandrate, LV_ALIGN_LEFT_MID);
     lv_label_set_text(ui_lblBandrate, "-");
@@ -1306,7 +1414,7 @@ static void ui_draw_main_screen(void)
     lv_obj_set_height(ui_panPower, lv_pct(100));
     lv_obj_set_align(ui_panPower, LV_ALIGN_RIGHT_MID);
     lv_obj_set_flex_flow(ui_panPower, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(ui_panPower, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_align(ui_panPower, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(ui_panPower, LV_OBJ_FLAG_SCROLLABLE); /// Flags
     lv_obj_set_style_bg_color(ui_panPower, lv_color_hex(COLOR_SHADOW), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_bg_opa(ui_panPower, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -1321,7 +1429,7 @@ static void ui_draw_main_screen(void)
     lv_obj_set_height(ui_lblCharge, LV_SIZE_CONTENT); /// 1
     lv_obj_set_align(ui_lblCharge, LV_ALIGN_RIGHT_MID);
     lv_label_set_text(ui_lblCharge, "");
-    lv_obj_set_y(ui_lblCharge, -1);
+    lv_obj_set_y(ui_lblCharge, 0);
     lv_obj_set_style_text_color(ui_lblCharge, lv_color_hex(COLOR_INFO_TEXT), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_opa(ui_lblCharge, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_align(ui_lblCharge, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -1350,7 +1458,7 @@ static void ui_draw_main_screen(void)
     lv_obj_set_height(ui_lblBattIcon, LV_SIZE_CONTENT); /// 1
     lv_obj_set_align(ui_lblBattIcon, LV_ALIGN_RIGHT_MID);
     lv_label_set_text(ui_lblBattIcon, LV_SYMBOL_BATTERY_FULL);
-    lv_obj_set_y(ui_lblBattIcon, 1);
+    lv_obj_set_y(ui_lblBattIcon, 0);
     lv_obj_set_style_text_color(ui_lblBattIcon, lv_color_hex(COLOR_INFO_TEXT), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_opa(ui_lblBattIcon, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_align(ui_lblBattIcon, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -1450,6 +1558,20 @@ static void ui_draw_main_screen(void)
     lv_obj_add_flag(ui_cursorV, LV_OBJ_FLAG_ADV_HITTEST);  /// Flags
     lv_obj_clear_flag(ui_cursorV, LV_OBJ_FLAG_SCROLLABLE); /// Flags
     lv_obj_set_x(ui_cursorV, -20);
+
+    ui_lblChartSpan = lv_label_create(ui_panCharts);
+    ui_lblChartTimestamp = lv_label_create(ui_panCharts);
+    for (lv_obj_t *label : {ui_lblChartSpan, ui_lblChartTimestamp})
+    {
+        lv_obj_set_style_text_font(label, &ui_font_SFMono_9, LV_PART_MAIN);
+        lv_obj_set_style_text_color(label, lv_color_hex(COLOR_HIGHLIGHT), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(label, LV_OPA_TRANSP, LV_PART_MAIN);
+    }
+    lv_label_set_text(ui_lblChartSpan, "--");
+    lv_label_set_text(ui_lblChartTimestamp, "");
+    lv_obj_align(ui_lblChartSpan, LV_ALIGN_BOTTOM_LEFT, 14, -1);
+    lv_obj_align(ui_lblChartTimestamp, LV_ALIGN_BOTTOM_RIGHT, -4, -1);
+    lv_obj_add_flag(ui_lblChartTimestamp, LV_OBJ_FLAG_HIDDEN);
 
     ui_panSeries = lv_obj_create(ui_panContainerChart);
     lv_obj_set_width(ui_panSeries, 300);
@@ -1680,7 +1802,7 @@ static void ui_draw_main_screen_test_mode(void)
     lv_obj_set_height(ui_panPower, lv_pct(100));
     lv_obj_set_align(ui_panPower, LV_ALIGN_RIGHT_MID);
     lv_obj_set_flex_flow(ui_panPower, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(ui_panPower, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_align(ui_panPower, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(ui_panPower, LV_OBJ_FLAG_SCROLLABLE); /// Flags
     lv_obj_set_style_bg_color(ui_panPower, lv_color_hex(COLOR_SHADOW), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_bg_opa(ui_panPower, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -1695,7 +1817,7 @@ static void ui_draw_main_screen_test_mode(void)
     lv_obj_set_height(ui_lblCharge, LV_SIZE_CONTENT); /// 1
     lv_obj_set_align(ui_lblCharge, LV_ALIGN_RIGHT_MID);
     lv_label_set_text(ui_lblCharge, "");
-    lv_obj_set_y(ui_lblCharge, -1);
+    lv_obj_set_y(ui_lblCharge, 0);
     lv_obj_set_style_text_color(ui_lblCharge, lv_color_hex(COLOR_INFO_TEXT), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_opa(ui_lblCharge, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_align(ui_lblCharge, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -1724,7 +1846,7 @@ static void ui_draw_main_screen_test_mode(void)
     lv_obj_set_height(ui_lblBattIcon, LV_SIZE_CONTENT); /// 1
     lv_obj_set_align(ui_lblBattIcon, LV_ALIGN_RIGHT_MID);
     lv_label_set_text(ui_lblBattIcon, LV_SYMBOL_BATTERY_FULL);
-    lv_obj_set_y(ui_lblBattIcon, 1);
+    lv_obj_set_y(ui_lblBattIcon, 0);
     lv_obj_set_style_text_color(ui_lblBattIcon, lv_color_hex(COLOR_INFO_TEXT), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_opa(ui_lblBattIcon, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_align(ui_lblBattIcon, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN | LV_STATE_DEFAULT);

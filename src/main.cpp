@@ -14,6 +14,7 @@
 #include "ui.h"
 #include "sdcard.h"
 #include "uart.h"
+#include "network_time.h"
 
 bool test_mode;
 
@@ -56,6 +57,7 @@ void setup()
 
     // Display
     ui_init();
+    if (!test_mode) network_time_init();
 }
 
 void loop()
