@@ -25,8 +25,8 @@ static void toggle_chart(void)
 
 static void toggle_rec(void)
 {
-    is_rec_status_changing = 1;
-    log_d("toggle rec: %d", is_rec_status_changing);
+    sdcard_toggle_rec();
+    log_d("toggle recording requested");
 }
 
 void buttons_init(void)

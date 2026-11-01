@@ -5,7 +5,14 @@
 #include <LovyanGFX.hpp>
 #include <lvgl.h>
 #include <ArduinoJson.h>
+#if __has_include(<esp32/rom/crc.h>)
 #include <esp32/rom/crc.h>
+#elif __has_include(<esp32s3/rom/crc.h>)
+#include <esp32s3/rom/crc.h>
+#else
+#include <esp_rom_crc.h>
+#define crc32_le esp_rom_crc32_le
+#endif
 #include "main.h"
 #include "pins.h"
 #include "uart.h"
@@ -41,7 +48,7 @@
 
 #define SCREEN_WIDTH 320
 #define SCREEN_HEIGHT 240
-#define TERM_ROW_MAX_NUM 40
+#define TERM_ROW_MAX_NUM 50
 #define TERM_LINE_MAX_LENGTH 352
 #define CHART_WIDTH_PIXEL 274
 #define CHART_RESET_AT_IDLE_LOOP 3

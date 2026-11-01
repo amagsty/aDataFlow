@@ -15,6 +15,8 @@
 
 extern uint32_t bandrate_list[12];
 extern uint8_t bandrate_index;
+enum class AutoBaudState : uint8_t { Idle, Measuring, Failed };
+extern volatile AutoBaudState bandrate_auto_state;
 void bandrate_init(void);
 void turn_off_backlights(void);
 void save_bandrate_to_nvs(void);

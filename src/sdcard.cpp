@@ -1,8 +1,17 @@
 
 #include "sdcard.h"
-bool is_rec_status_changing;
-static bool is_recording;
-static uint8_t led_blink_type; // 0 - idle, do nothing, 1 - slow, 2 - fast, 10 - on, others - off
+#include "recording_helpers.h"
+#include "freertos/semphr.h"
+#include <atomic>
+#include <cstring>
+
+static std::atomic<bool> pending_toggle{false};
+static std::atomic<bool> recording_transition{false};
+static SemaphoreHandle_t recording_mutex;
+static std::atomic<bool> is_recording{false};
+static bool rec_led_pwm = false;
+static constexpr uint8_t REC_LED_DUTY = 38; // 15% of 8-bit PWM
+static std::atomic<uint8_t> led_blink_type{0}; // 0 - idle, do nothing, 1 - slow, 2 - fast, 10 - on, others - off
 static File new_file_rx;
 static File new_file_tx;
 static char rand_folder_name[10];
@@ -211,250 +220,214 @@ void testFileIO(fs::FS &fs, const char *path)
 }
  */
 
-void rec_stop()
+// Caller holds recording_mutex so files cannot be closed during a write.
+static void rec_stop()
 {
-  log_i("stop recording...");
+  is_recording = false;
   new_file_rx.close();
   new_file_tx.close();
   SD_MMC.end();
   led_blink_type = 99;
-  is_recording = false;
-  is_rec_status_changing = false;
   log_i("recording stopped");
+}
+
+void sdcard_toggle_rec(void)
+{
+  if (recording_mutex != nullptr)
+    pending_toggle.store(true);
 }
 
 void rec(bool is_rx, char *s)
 {
-  if (is_rec_status_changing || is_recording == false)
+  if (recording_mutex == nullptr || recording_transition.load() || s == nullptr)
+    return;
+  xSemaphoreTake(recording_mutex, portMAX_DELAY);
+  if (!is_recording || recording_transition.load())
   {
+    xSemaphoreGive(recording_mutex);
     return;
   }
-  // hold power until written
-  if (digitalRead(PIN_SD_CD) == LOW && batt_low == false)
+  hold_power_on = true;
+  if (digitalRead(PIN_SD_CD) == LOW && !batt_low)
   {
-    hold_power_on = true;
-    if (is_rx)
+    File &file = is_rx ? new_file_rx : new_file_tx;
+    const size_t expected = std::strlen(s);
+    if (!file || file.print(s) != expected)
     {
-      if (new_file_rx)
-      {
-        if (new_file_rx.print(s))
-        {
-          log_d("rec rx: %s", s);
-        }
-        else
-        {
-          rec_stop();
-          log_e("rec rx error");
-        }
-      }
-      else
-      {
-        rec_stop();
-        log_e("rx file error");
-      }
+      log_e("recording write failed or was incomplete");
+      rec_stop();
     }
-    else
-    {
-      if (new_file_tx)
-      {
-        if (new_file_tx.print(s))
-        {
-          log_d("rec tx: %s", s);
-        }
-        else
-        {
-          rec_stop();
-          log_e("rec tx error");
-        }
-      }
-      else
-      {
-        rec_stop();
-        log_e("tx file error");
-      }
-    }
-    hold_power_on = false;
   }
   else
   {
-    log_i("sd card was removed...");
+    log_w("SD removed or battery low during recording");
     rec_stop();
   }
+  hold_power_on = false;
+  xSemaphoreGive(recording_mutex);
+}
+
+void sdcard_pairing_hint()
+{
+  led_blink_type.store(2); // Existing fast hint, 15% duty; restore recording state afterwards.
+}
+
+static void rec_led_set(bool on)
+{
+  if (rec_led_pwm)
+    ledcWrite(PIN_LED_REC, on ? REC_LED_DUTY : 0);
+  else
+    digitalWrite(PIN_LED_REC, on ? HIGH : LOW);
+}
+
+static void rec_led_tick()
+{
+  const uint8_t command = led_blink_type.exchange(0);
+  if (command == 1 || command == 2)
+  {
+    const uint32_t delay_ms = command == 1 ? 200 : 100;
+    rec_led_set(true);
+    vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    rec_led_set(false);
+    vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    rec_led_set(true);
+    vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    rec_led_set(false);
+  }
+  rec_led_set(is_recording.load());
 }
 
 static void task_led_blink(void *pvParameters)
 {
   for (;;)
   {
-    switch (led_blink_type)
-    {
-    case 0:
-      // idle
-      break;
-
-    case 1:
-      // slow
-      digitalWrite(PIN_LED_REC, HIGH);
-      vTaskDelay(200);
-      digitalWrite(PIN_LED_REC, LOW);
-      vTaskDelay(200);
-      digitalWrite(PIN_LED_REC, HIGH);
-      vTaskDelay(200);
-      digitalWrite(PIN_LED_REC, LOW);
-      led_blink_type = 0;
-      break;
-
-    case 2:
-      // fast
-      digitalWrite(PIN_LED_REC, HIGH);
-      vTaskDelay(100);
-      digitalWrite(PIN_LED_REC, LOW);
-      vTaskDelay(100);
-      digitalWrite(PIN_LED_REC, HIGH);
-      vTaskDelay(100);
-      digitalWrite(PIN_LED_REC, LOW);
-      led_blink_type = 0;
-      break;
-
-    case 10:
-      // always on
-      digitalWrite(PIN_LED_REC, HIGH);
-      led_blink_type = 0;
-      break;
-
-    default:
-      // off
-      digitalWrite(PIN_LED_REC, LOW);
-      led_blink_type = 0;
-      break;
-    }
-    vTaskDelay(100);
+    rec_led_tick();
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
-  vTaskDelete(NULL);
+}
+
+static bool prepare_recording_folder()
+{
+  if (is_first_check)
+  {
+    if (!create_recording_folder(SD_MMC, rand_folder_name, sizeof(rand_folder_name),
+                                 CREATE_MAX_RETRY, []() { return random(10000); }))
+    {
+      log_e("failed to create recording directory after %u attempts", CREATE_MAX_RETRY);
+      return false;
+    }
+    is_first_check = false;
+    log_i("folder created: %s", rand_folder_name);
+    return true;
+  }
+  if (!SD_MMC.exists(rand_folder_name))
+  {
+    if (!SD_MMC.mkdir(rand_folder_name))
+    {
+      log_e("failed to recreate recording directory: %s", rand_folder_name);
+      return false;
+    }
+    return true;
+  }
+  File directory = SD_MMC.open(rand_folder_name);
+  const bool valid = directory && directory.isDirectory();
+  directory.close();
+  if (!valid)
+    log_e("recording path is not a directory: %s", rand_folder_name);
+  return valid;
+}
+
+static bool rec_start(uint8_t &error_blink)
+{
+  error_blink = 2;
+  if (digitalRead(PIN_SD_CD) != LOW || batt_low)
+  {
+    error_blink = 1;
+    log_w("no SD card detected or battery low");
+    return false;
+  }
+  if (!SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT))
+  {
+    log_e("SD card mount failed");
+    return false;
+  }
+  if (SD_MMC.cardType() == CARD_NONE)
+  {
+    log_e("no SD card attached");
+    return false;
+  }
+  if (!prepare_recording_folder())
+    return false;
+
+  char path_rx[30];
+  char path_tx[30];
+  const unsigned long timestamp = millis();
+  snprintf(path_rx, sizeof(path_rx), "%s/RX_%lu.txt", rand_folder_name, timestamp);
+  snprintf(path_tx, sizeof(path_tx), "%s/TX_%lu.txt", rand_folder_name, timestamp);
+  new_file_rx = SD_MMC.open(path_rx, FILE_APPEND);
+  new_file_tx = SD_MMC.open(path_tx, FILE_APPEND);
+  if (!new_file_rx || !new_file_tx)
+  {
+    log_e("failed to open both recording files");
+    return false;
+  }
+  // Publish recording status only once the directory and both files are ready.
+  is_recording = true;
+  led_blink_type = 10;
+  log_i("recording RX=%s TX=%s", path_rx, path_tx);
+  return true;
 }
 
 static void task_rec_status(void *pvParameters)
 {
   for (;;)
   {
-    if (is_rec_status_changing)
+    if (pending_toggle.exchange(false))
     {
+      recording_transition.store(true);
+      xSemaphoreTake(recording_mutex, portMAX_DELAY);
+      hold_power_on = true;
       if (is_recording)
-      {
-        // toggle to stop recording and unmount sdcard
         rec_stop();
-      }
       else
       {
-        // mount sdcard and toggle to start recording
-        log_i("start recording...");
-        if (digitalRead(PIN_SD_CD) == LOW && batt_low == false)
+        uint8_t error_blink;
+        if (!rec_start(error_blink))
         {
-          // sdcard exist
-          if (!SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT))
-          {
-            is_recording = false;
-            led_blink_type = 2;
-            log_e("Card Mount Failed");
-          }
-          else
-          {
-            uint8_t cardType = SD_MMC.cardType();
-            if (cardType == CARD_NONE)
-            {
-              is_recording = false;
-              led_blink_type = 2;
-              log_i("No SD_MMC card attached");
-            }
-            else
-            {
-              log_i("SD_MMC Card Type: %d (1=MMC, 2=SDSC, 3=SDHC)", cardType);
-              uint64_t cardSize = SD_MMC.cardSize() / (1024 * 1024);
-              log_i("SD_MMC Card Size: %lluMB", cardSize);
-              log_i("Total space: %lluMB", SD_MMC.totalBytes() / (1024 * 1024));
-              log_i("Used space: %lluMB", SD_MMC.usedBytes() / (1024 * 1024));
-              led_blink_type = 10;
-              is_recording = true;
-
-              // filename: DAT_rand(0-10000)/millis_from_boot.txt
-              // DAT_9999/99999999.txt
-              if (is_first_check)
-              {
-                // generate one new data folder:
-                uint8_t chk_counter;
-                for (size_t i = 0; i < CREATE_MAX_RETRY; i++)
-                {
-                  chk_counter++;
-                  snprintf(rand_folder_name, sizeof(rand_folder_name), "/DAT_%04d", random(10000));
-                  if (!SD_MMC.exists(rand_folder_name))
-                  {
-                    SD_MMC.mkdir(rand_folder_name);
-                    log_i("folder created: %s", rand_folder_name);
-                    break;
-                  }
-                }
-                if (chk_counter >= CREATE_MAX_RETRY)
-                {
-                  log_e("no available folder name");
-                  rec_stop();
-                }
-                else
-                {
-                  is_first_check = false;
-                }
-              }
-              else
-              {
-                if (!SD_MMC.exists(rand_folder_name))
-                {
-                  SD_MMC.mkdir(rand_folder_name);
-                  log_i("folder recreated: %s", rand_folder_name);
-                }
-              }
-
-              char path_rx[30];
-              char path_tx[30];
-              unsigned long m = millis();
-              // /DAT_9999/4294967295.txt
-              snprintf(path_rx, sizeof(path_rx), "%s/RX_%ld.txt", rand_folder_name, m);
-              log_i("try this file rx: %s", path_rx);
-              new_file_rx = SD_MMC.open(path_rx, FILE_APPEND);
-
-              snprintf(path_tx, sizeof(path_tx), "%s/TX_%ld.txt", rand_folder_name, m);
-              log_i("try this file tx: %s", path_tx);
-              new_file_tx = SD_MMC.open(path_tx, FILE_APPEND);
-
-              if (!new_file_rx || !new_file_tx)
-              {
-                log_e("failed to open file for saving");
-                rec_stop();
-              }
-              else
-              {
-                log_i("rx rec to file: %s, %s", path_rx, path_tx);
-              }
-            }
-          }
-        }
-        else
-        {
-          // no sdcard
-          // blink led for error
-          led_blink_type = 1;
-          is_recording = false;
-          log_i("no sdcard detected");
+          rec_stop();
+          led_blink_type = error_blink;
         }
       }
-      is_rec_status_changing = false;
+      hold_power_on = false;
+      xSemaphoreGive(recording_mutex);
+      recording_transition.store(false);
     }
-    vTaskDelay(100);
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
-  vTaskDelete(NULL);
 }
 
 void sdcard_init(void)
 {
+  // Channel 6 uses timer 3; the LCD backlight uses channel 1 / timer 0.
+  rec_led_pwm = ledcAttachChannel(PIN_LED_REC, 5000, 8, 6);
+  if (rec_led_pwm)
+    ledcWrite(PIN_LED_REC, 0);
+  else
+    log_e("recording LED PWM attachment failed");
+  recording_mutex = xSemaphoreCreateMutex();
+  if (recording_mutex == nullptr)
+  {
+    log_e("failed to allocate recording mutex");
+    return;
+  }
   SD_MMC.setPins(PIN_SD_CLK, PIN_SD_CMD, PIN_SD_DATA0);
-  xTaskCreatePinnedToCore(task_led_blink, "led rec", 2048, NULL, 1, NULL, 0);
-  xTaskCreatePinnedToCore(task_rec_status, "rec status chkr", 8192, NULL, 1, NULL, 0);
+  if (xTaskCreatePinnedToCore(task_rec_status, "rec status chkr", 8192, nullptr, 1, nullptr, 0) != pdPASS)
+  {
+    log_e("failed to create recording task");
+    vSemaphoreDelete(recording_mutex);
+    recording_mutex = nullptr;
+    return;
+  }
+  if (xTaskCreatePinnedToCore(task_led_blink, "led rec", 2048, nullptr, 1, nullptr, 0) != pdPASS)
+    log_e("failed to create recording LED task");
 }

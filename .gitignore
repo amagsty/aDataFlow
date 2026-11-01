@@ -1,0 +1,9 @@
+esp32
+.pio
+dist/
+__pycache__/
+*.pyc
+.venv/
+排查总结与待修复问题.md
+
+/include/wifi_credentials.h
