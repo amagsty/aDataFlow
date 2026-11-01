@@ -12,6 +12,7 @@
 #define CREATE_MAX_RETRY 10
 
 void sdcard_init(void);
+void sdcard_pairing_hint();
 void rec(bool is_rx, char *s);
 void sdcard_toggle_rec(void);
 

@@ -8,8 +8,10 @@
 static std::atomic<bool> pending_toggle{false};
 static std::atomic<bool> recording_transition{false};
 static SemaphoreHandle_t recording_mutex;
-static bool is_recording;
-static uint8_t led_blink_type; // 0 - idle, do nothing, 1 - slow, 2 - fast, 10 - on, others - off
+static std::atomic<bool> is_recording{false};
+static bool rec_led_pwm = false;
+static constexpr uint8_t REC_LED_DUTY = 38; // 15% of 8-bit PWM
+static std::atomic<uint8_t> led_blink_type{0}; // 0 - idle, do nothing, 1 - slow, 2 - fast, 10 - on, others - off
 static File new_file_rx;
 static File new_file_tx;
 static char rand_folder_name[10];
@@ -265,55 +267,43 @@ void rec(bool is_rx, char *s)
   xSemaphoreGive(recording_mutex);
 }
 
+void sdcard_pairing_hint()
+{
+  led_blink_type.store(2); // Existing fast hint, 15% duty; restore recording state afterwards.
+}
+
+static void rec_led_set(bool on)
+{
+  if (rec_led_pwm)
+    ledcWrite(PIN_LED_REC, on ? REC_LED_DUTY : 0);
+  else
+    digitalWrite(PIN_LED_REC, on ? HIGH : LOW);
+}
+
+static void rec_led_tick()
+{
+  const uint8_t command = led_blink_type.exchange(0);
+  if (command == 1 || command == 2)
+  {
+    const uint32_t delay_ms = command == 1 ? 200 : 100;
+    rec_led_set(true);
+    vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    rec_led_set(false);
+    vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    rec_led_set(true);
+    vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    rec_led_set(false);
+  }
+  rec_led_set(is_recording.load());
+}
+
 static void task_led_blink(void *pvParameters)
 {
   for (;;)
   {
-    switch (led_blink_type)
-    {
-    case 0:
-      // idle
-      break;
-
-    case 1:
-      // slow
-      digitalWrite(PIN_LED_REC, HIGH);
-      vTaskDelay(200);
-      digitalWrite(PIN_LED_REC, LOW);
-      vTaskDelay(200);
-      digitalWrite(PIN_LED_REC, HIGH);
-      vTaskDelay(200);
-      digitalWrite(PIN_LED_REC, LOW);
-      led_blink_type = 0;
-      break;
-
-    case 2:
-      // fast
-      digitalWrite(PIN_LED_REC, HIGH);
-      vTaskDelay(100);
-      digitalWrite(PIN_LED_REC, LOW);
-      vTaskDelay(100);
-      digitalWrite(PIN_LED_REC, HIGH);
-      vTaskDelay(100);
-      digitalWrite(PIN_LED_REC, LOW);
-      led_blink_type = 0;
-      break;
-
-    case 10:
-      // always on
-      digitalWrite(PIN_LED_REC, HIGH);
-      led_blink_type = 0;
-      break;
-
-    default:
-      // off
-      digitalWrite(PIN_LED_REC, LOW);
-      led_blink_type = 0;
-      break;
-    }
-    vTaskDelay(100);
+    rec_led_tick();
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
-  vTaskDelete(NULL);
 }
 
 static bool prepare_recording_folder()
@@ -418,6 +408,12 @@ static void task_rec_status(void *pvParameters)
 
 void sdcard_init(void)
 {
+  // Channel 6 uses timer 3; the LCD backlight uses channel 1 / timer 0.
+  rec_led_pwm = ledcAttachChannel(PIN_LED_REC, 5000, 8, 6);
+  if (rec_led_pwm)
+    ledcWrite(PIN_LED_REC, 0);
+  else
+    log_e("recording LED PWM attachment failed");
   recording_mutex = xSemaphoreCreateMutex();
   if (recording_mutex == nullptr)
   {

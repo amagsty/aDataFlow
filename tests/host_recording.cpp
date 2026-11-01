@@ -12,22 +12,30 @@
 #define log_w(...) ((void)0)
 #define log_e(...) ((void)0)
 #define pdMS_TO_TICKS(x) (x)
-constexpr int LOW = 0, PIN_SD_CD = 12, SDMMC_FREQ_DEFAULT = 20, CARD_NONE = 0;
+constexpr int LOW = 0, HIGH = 1, PIN_LED_REC = 3, PIN_SD_CD = 12, SDMMC_FREQ_DEFAULT = 20, CARD_NONE = 0;
 constexpr int FILE_APPEND = 1, CREATE_MAX_RETRY = 10, portMAX_DELAY = -1;
 void *recording_mutex = reinterpret_cast<void *>(1);
 int lock_depth = 0;
 void xSemaphoreTake(void *, int) { assert(lock_depth == 0); ++lock_depth; }
 void xSemaphoreGive(void *) { assert(lock_depth == 1); --lock_depth; }
 struct EndIteration {};
-void vTaskDelay(int) { throw EndIteration{}; }
+static bool testing_led = false;
+static int led_delay = 0;
+static std::vector<unsigned> led_duties;
+void vTaskDelay(int delay) { if (testing_led) led_delay += delay; else throw EndIteration{}; }
+void digitalWrite(int pin, int duty) { assert(pin == PIN_LED_REC); led_duties.push_back(duty ? 255 : 0); }
+void ledcWrite(int pin, unsigned duty) { assert(pin == PIN_LED_REC); led_duties.push_back(duty); }
+static bool rec_led_pwm = true;
+static constexpr uint8_t REC_LED_DUTY = 38;
 uint32_t millis() { return 123456; }
 bool card_inserted = true, batt_low = false, hold_power_on = false;
 int digitalRead(int) { return card_inserted ? LOW : 1; }
 unsigned next_folder = 0;
 long random(int) { return next_folder++; }
-bool is_recording = false, is_first_check = true;
+std::atomic<bool> is_recording{false};
+bool is_first_check = true;
 std::atomic<bool> pending_toggle{false}, recording_transition{false};
-uint8_t led_blink_type = 0;
+std::atomic<uint8_t> led_blink_type{0};
 char rand_folder_name[10] = {};
 
 struct FileState { bool directory = false, closed = false, partial = false; int writes = 0; };
@@ -121,5 +129,22 @@ int main()
     card_inserted = false;
     rec(false, data);
     assert(!is_recording && !SD_MMC.mounted && lock_depth == 0);
+    testing_led = true;
+    for (uint8_t command : {1, 2, 10, 99})
+    {
+        is_recording = command == 10;
+        led_blink_type = command;
+        led_duties.clear(); led_delay = 0;
+        rec_led_tick();
+        for (unsigned duty : led_duties) assert(duty == 0 || duty == 38);
+        if (command == 1 || command == 2)
+        {
+            assert(led_duties.size() == 5);
+            assert(led_duties[0] == 38 && led_duties[1] == 0);
+            assert(led_duties[2] == 38 && led_duties[3] == 0);
+            assert(led_delay == (command == 1 ? 600 : 300));
+        }
+        assert(led_duties.back() == (is_recording ? 38u : 0u));
+    }
     std::cout << "PASS: actual SD start/stop/write flow, final retry success, failed second file, mkdir failure, missing card and partial write cleanup\n";
 }
