@@ -4,8 +4,10 @@
 
 // porting and backlight
 static lv_disp_draw_buf_t draw_buf;
-static lv_color_t buf1[16000];
-static lv_color_t buf2[16000];
+// Two 16-line DMA tiles leave internal RAM for Wi-Fi and UART task stacks.
+static constexpr size_t DRAW_BUFFER_PIXELS = SCREEN_WIDTH * 16;
+static lv_color_t buf1[DRAW_BUFFER_PIXELS];
+static lv_color_t buf2[DRAW_BUFFER_PIXELS];
 static lv_indev_t *indev_encoder;
 static lv_group_t *group_encoder;
 static int32_t encoder_diff;
@@ -900,7 +902,7 @@ static bool lv_port_init(void)
 
     // lv_port
     lv_init();
-    lv_disp_draw_buf_init(&draw_buf, buf1, buf2, 16000);
+    lv_disp_draw_buf_init(&draw_buf, buf1, buf2, DRAW_BUFFER_PIXELS);
 
     /*Initialize the display*/
     static lv_disp_drv_t disp_drv;

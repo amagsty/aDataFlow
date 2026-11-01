@@ -4,6 +4,8 @@
 #include "driver/uart.h"
 #include "freertos/semphr.h"
 #include <string.h>
+#include <esp_timer.h>
+#include <atomic>
 
 // Define UART interrupts
 typedef enum
@@ -44,6 +46,19 @@ typedef struct
 static uart_line_buffer_t rx_line_buffer = {};
 static uart_line_buffer_t tx_line_buffer = {};
 
+// UART callbacks run on Arduino's 2 KB event-task stack. Even log_w's
+// vsnprintf can overflow that stack: collect counters here, format elsewhere.
+static std::atomic<uint32_t> rx_queue_full{0}, tx_queue_full{0};
+static std::atomic<uint32_t> rx_overlong{0}, tx_overlong{0};
+
+static uart_drop_stats_t take_uart_drop_stats()
+{
+    return {rx_queue_full.exchange(0, std::memory_order_relaxed),
+            tx_queue_full.exchange(0, std::memory_order_relaxed),
+            rx_overlong.exchange(0, std::memory_order_relaxed),
+            tx_overlong.exchange(0, std::memory_order_relaxed)};
+}
+
 static void enqueue_uart_line(uart_line_buffer_t *line, bool is_rx)
 {
     if (line->length == 0)
@@ -56,10 +71,11 @@ static void enqueue_uart_line(uart_line_buffer_t *line, bool is_rx)
     q.data_char[line->length] = '\0';
     q.data_len = line->length;
     q.is_rx = is_rx;
+    q.received_us = esp_timer_get_time();
 
     if (xQueueSend(uart_queue, &q, 0) != pdPASS)
     {
-        log_w("UART line queue full; line dropped");
+        (is_rx ? rx_queue_full : tx_queue_full).fetch_add(1, std::memory_order_relaxed);
     }
     line->length = 0;
 }
@@ -113,12 +129,21 @@ static void collect_uart_lines(HardwareSerial &serial, uart_line_buffer_t *line,
         {
             line->length = 0;
             line->dropping_overlong_line = true;
-            log_w("UART line exceeded %u bytes; discarding until newline", (unsigned)UART_LINE_MAX_LENGTH);
+            (is_rx ? rx_overlong : tx_overlong).fetch_add(1, std::memory_order_relaxed);
             continue;
         }
 
         line->data[line->length++] = c;
     }
+}
+
+void uart_report_drops()
+{
+    const auto stats = take_uart_drop_stats();
+    if (stats.rx_queue_full || stats.tx_queue_full || stats.rx_overlong || stats.tx_overlong)
+        log_w("UART dropped lines: queue full RX=%lu TX=%lu; overlong RX=%lu TX=%lu",
+              (unsigned long)stats.rx_queue_full, (unsigned long)stats.tx_queue_full,
+              (unsigned long)stats.rx_overlong, (unsigned long)stats.tx_overlong);
 }
 
 void onReceive_rx_cb()

@@ -17,9 +17,20 @@ typedef struct queue_t
     char data_char[UART_LINE_MAX_LENGTH + 2]; // payload, one line ending, and NUL
     uint16_t data_len;
     bool is_rx;
+    uint64_t received_us; // monotonic time when the complete line was queued
 } uart_data_t;
 
+struct uart_drop_stats_t
+{
+    uint32_t rx_queue_full;
+    uint32_t tx_queue_full;
+    uint32_t rx_overlong;
+    uint32_t tx_overlong;
+};
+
 extern QueueHandle_t uart_queue;
+// Drain counters and report them from a normal task, never a UART callback.
+void uart_report_drops();
 void uart_change_bandrate(uint32_t bandrate);
 void uart_init(void);
 
