@@ -1,6 +1,7 @@
 #include "ui.h"
 #include "chart_validation.h"
 #include <stdio.h>
+#include <esp_heap_caps.h>
 
 // porting and backlight
 static lv_disp_draw_buf_t draw_buf;
@@ -467,10 +468,193 @@ static void ui_term_new_line(bool is_rx)
     lv_label_set_text_fmt(ui_lblLineCounter, "%lu", (unsigned long)lineCount);
 }
 
-static void ui_record_terminal_line(bool is_rx, const char *text)
+// Keep the original queued bytes separate from display and JSON parsing.
+struct terminal_row
+{
+    size_t length;
+    uint16_t hex_columns;
+    bool hex;
+    char data[1]; // raw bytes + NUL, followed by plain display text
+};
+static bool terminal_hex = false;
+static uint32_t terminal_pressed_ms = 0;
+static bool terminal_press_pending = false;
+static bool terminal_pressed_in_chart = false;
+static constexpr uint32_t TERMINAL_LONG_PRESS_MS = 2000;
+static constexpr size_t TERMINAL_HEX_PREVIEW_BYTES = 256;
+
+static void ui_terminal_row_delete(lv_event_t *event)
+{
+    lv_obj_t *label = lv_event_get_target(event);
+    free(lv_obj_get_user_data(label));
+    lv_obj_set_user_data(label, nullptr);
+}
+
+// Draw byte colors directly. The text buffer contains no color commands, so
+// wrapping or scrolling can never expose markup or lose its parser state.
+static void ui_draw_terminal_hex(lv_event_t *event)
+{
+    lv_obj_t *label = lv_event_get_target(event);
+    auto *row = static_cast<terminal_row *>(lv_obj_get_user_data(label));
+    if (row == nullptr || !row->hex) return;
+    lv_draw_ctx_t *context = lv_event_get_draw_ctx(event);
+    lv_draw_label_dsc_t draw;
+    lv_draw_label_dsc_init(&draw);
+    draw.font = lv_obj_get_style_text_font(label, LV_PART_MAIN);
+    draw.letter_space = lv_obj_get_style_text_letter_space(label, LV_PART_MAIN);
+    draw.opa = lv_obj_get_style_opa_recursive(label, LV_PART_MAIN);
+    draw.bidi_dir = LV_BASE_DIR_LTR;
+    const lv_color_t primary = lv_obj_get_style_text_color(label, LV_PART_MAIN);
+    const lv_color_t alternate = primary.full == lv_color_hex(COLOR_TERM_TX_TEXT).full ?
+                                lv_color_hex(COLOR_TERM_RX_TEXT) : lv_color_hex(0x6AC5DB);
+    const lv_coord_t byte_width = lv_txt_get_width("00", 2, draw.font, draw.letter_space, LV_TEXT_FLAG_NONE);
+    const lv_coord_t line_height = lv_font_get_line_height(draw.font);
+    const lv_coord_t line_step = line_height + lv_obj_get_style_text_line_space(label, LV_PART_MAIN);
+    lv_area_t content;
+    lv_obj_get_content_coords(label, &content);
+    const bool align_right = lv_obj_get_style_text_align(label, LV_PART_MAIN) == LV_TEXT_ALIGN_RIGHT;
+    const char *line = row->data + row->length + 1;
+    const size_t shown = row->length < TERMINAL_HEX_PREVIEW_BYTES ? row->length : TERMINAL_HEX_PREVIEW_BYTES;
+    size_t byte_index = 0;
+    lv_coord_t y = content.y1;
+    while (*line)
+    {
+        const char *end = strchr(line, '\n');
+        const size_t length = end ? size_t(end - line) : strlen(line);
+        const lv_coord_t width = lv_txt_get_width(line, length, draw.font, draw.letter_space, LV_TEXT_FLAG_NONE);
+        lv_coord_t x = align_right ? content.x2 - width + 1 : content.x1;
+        if (byte_index < shown)
+        {
+            for (size_t i = 0; i + 1 < length; i += 2, ++byte_index)
+            {
+                const char byte[] = {line[i], line[i + 1], '\0'};
+                draw.color = byte_index % 2 == 0 ? primary : alternate;
+                const lv_area_t area = {x, y, lv_coord_t(x + byte_width - 1), lv_coord_t(y + line_height - 1)};
+                lv_draw_label(context, &draw, &area, byte, nullptr);
+                x += byte_width + draw.letter_space;
+            }
+        }
+        else
+        {
+            draw.color = primary;
+            const lv_area_t area = {x, y, content.x2, lv_coord_t(y + line_height - 1)};
+            lv_draw_label(context, &draw, &area, line, nullptr);
+        }
+        if (end == nullptr) break;
+        line = end + 1;
+        y += line_step;
+    }
+}
+
+static void ui_render_terminal_row(lv_obj_t *label)
+{
+    auto *row = static_cast<terminal_row *>(lv_obj_get_user_data(label));
+    if (row == nullptr)
+        return;
+    char *output = row->data + row->length + 1;
+    row->hex = terminal_hex;
+    if (terminal_hex)
+    {
+        static constexpr char digits[] = "0123456789ABCDEF";
+        size_t pos = 0;
+        lv_obj_update_layout(label);
+        const lv_font_t *font = lv_obj_get_style_text_font(label, LV_PART_MAIN);
+        const lv_coord_t spacing = lv_obj_get_style_text_letter_space(label, LV_PART_MAIN);
+        const lv_coord_t stride = lv_txt_get_width("00", 2, font, spacing, LV_TEXT_FLAG_NONE) + spacing;
+        const lv_coord_t width = lv_obj_get_content_width(label);
+        const int columns = stride > 0 ? (width + spacing) / stride : 1;
+        row->hex_columns = columns > 0 ? columns : 1;
+        // Fifty fully wrapped 2KB HEX rows exceed LVGL's 16-bit scroll range.
+        const size_t shown = row->length < TERMINAL_HEX_PREVIEW_BYTES ? row->length : TERMINAL_HEX_PREVIEW_BYTES;
+        for (size_t i = 0; i < shown; ++i)
+        {
+            const uint8_t byte = static_cast<uint8_t>(row->data[i]);
+            if (i != 0 && i % row->hex_columns == 0)
+                output[pos++] = '\n';
+            output[pos++] = digits[byte >> 4];
+            output[pos++] = digits[byte & 15];
+        }
+        output[pos] = '\0';
+        if (shown < row->length)
+            snprintf(output + pos, 48, "\n(+%u bytes)", unsigned(row->length - shown));
+    }
+    else
+    {
+        size_t length = row->length;
+        while (length && (row->data[length - 1] == '\r' || row->data[length - 1] == '\n'))
+            --length;
+        for (size_t i = 0; i < length; ++i)
+            output[i] = row->data[i] == '\0' ? '.' : row->data[i];
+        output[length] = '\0';
+    }
+    lv_label_set_recolor(label, false);
+    // The label measures and wraps plain text; the draw callback supplies HEX colors.
+    lv_obj_set_style_text_opa(label, terminal_hex ? LV_OPA_TRANSP : LV_OPA_COVER, LV_PART_MAIN);
+    // Both buffers belong to the row; LVGL need not duplicate long HEX text.
+    lv_label_set_text_static(label, output);
+}
+
+static void ui_record_terminal_line(bool is_rx, const char *text, size_t length)
 {
     ui_term_new_line(is_rx);
-    lv_label_set_text(currentLine, text);
+    if (length > UART_LINE_MAX_LENGTH + 1)
+        length = UART_LINE_MAX_LENGTH + 1;
+    const size_t preview = length < TERMINAL_HEX_PREVIEW_BYTES ? length : TERMINAL_HEX_PREVIEW_BYTES;
+    const size_t hex_capacity = 3 * preview + 48;
+    const size_t display_capacity = length + 1 > hex_capacity ? length + 1 : hex_capacity;
+    const size_t bytes = sizeof(terminal_row) + length + 1 + display_capacity;
+    auto *row = static_cast<terminal_row *>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (row == nullptr)
+        row = static_cast<terminal_row *>(heap_caps_malloc(bytes, MALLOC_CAP_8BIT));
+    if (row == nullptr)
+    {
+        lv_label_set_text(currentLine, "[history allocation failed]");
+        return;
+    }
+    row->length = length;
+    memcpy(row->data, text, length);
+    row->data[length] = '\0';
+    lv_obj_set_user_data(currentLine, row);
+    lv_obj_add_event_cb(currentLine, ui_terminal_row_delete, LV_EVENT_DELETE, nullptr);
+    lv_obj_add_event_cb(currentLine, ui_draw_terminal_hex, LV_EVENT_DRAW_MAIN, nullptr);
+    ui_render_terminal_row(currentLine);
+}
+
+static void ui_toggle_terminal_format()
+{
+    terminal_hex = !terminal_hex;
+    const lv_coord_t previous_scroll = lv_obj_get_scroll_y(ui_panList);
+    for (uint32_t i = 0; i < lv_obj_get_child_cnt(ui_panList); ++i)
+        ui_render_terminal_row(lv_obj_get_child(ui_panList, i));
+    lv_obj_update_layout(ui_panList);
+    if (panList_scroll_to_view)
+        lv_obj_scroll_to_view(currentLine, LV_ANIM_OFF);
+    else
+        lv_obj_scroll_to_y(ui_panList, previous_scroll, LV_ANIM_OFF);
+}
+
+// A scrollable encoder target does not receive LV_EVENT_LONG_PRESSED in LVGL 8.
+// There is one object in the group, so LVGL keeps editing enabled on a long hold.
+static bool ui_terminal_button_event(lv_event_code_t code)
+{
+    if (code == LV_EVENT_PRESSED)
+    {
+        terminal_pressed_ms = millis();
+        terminal_press_pending = true;
+        terminal_pressed_in_chart = is_chart;
+    }
+    if (code == LV_EVENT_RELEASED)
+    {
+        const bool toggle = terminal_press_pending && !terminal_pressed_in_chart && !is_chart &&
+                            uint32_t(millis() - terminal_pressed_ms) >= TERMINAL_LONG_PRESS_MS;
+        terminal_press_pending = false;
+        if (toggle)
+        {
+            ui_toggle_terminal_format();
+            return true; // Do not also run the short-press scroll action.
+        }
+    }
+    return false;
 }
 
 static void ui_star_shoot(bool is_rx, char *data)
@@ -522,6 +706,9 @@ static void ui_task_update_main_screen(void *pvParameters)
 
                 if (pdTRUE == xSemaphoreTake(lvgl_mutex, portMAX_DELAY))
                 {
+                    // Capture raw bytes before strtok mutates the queue buffer.
+                    ui_record_terminal_line(q.is_rx, q.data_char, q.data_len);
+
                     // header and footer of data_char check
                     if (q.data_char[0] == 10 || q.data_char[0] == 13)
                     {
@@ -546,8 +733,6 @@ static void ui_task_update_main_screen(void *pvParameters)
                         if (is_new_line)
                         {
                             current_str = pch;
-                            // Capture terminal history in both views, exactly once per line.
-                            ui_record_terminal_line(q.is_rx, pch);
                             ui_star_shoot(q.is_rx, pch);
 
                             JsonDocument doc;
@@ -833,6 +1018,8 @@ static void ui_hw_encoder_read(lv_indev_drv_t *indev, lv_indev_data_t *data)
 static void ui_event_panList(lv_event_t *e)
 {
     lv_event_code_t panList_event_code = lv_event_get_code(e);
+    if (ui_terminal_button_event(panList_event_code))
+        return;
     if (panList_event_code == LV_EVENT_RELEASED)
     {
         if (is_chart)
@@ -861,7 +1048,10 @@ static void ui_event_panList(lv_event_t *e)
         }
         log_i("panList_event_code: LV_EVENT_RELEASED");
     }
-    if (panList_event_code == LV_EVENT_KEY && panList_scroll_to_view)
+    // LVGL sends ENTER after encoder release too; only rotation pauses following.
+    const uint32_t key = panList_event_code == LV_EVENT_KEY ? lv_event_get_key(e) : 0;
+    if (panList_event_code == LV_EVENT_KEY && panList_scroll_to_view &&
+        (key == LV_KEY_LEFT || key == LV_KEY_RIGHT || key == LV_KEY_UP || key == LV_KEY_DOWN))
     {
         if (millis() - terminal_released_millis > 500)
         {

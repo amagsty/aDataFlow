@@ -1,20 +1,43 @@
 #include "lvgl.h"
+#include <ArduinoJson.h>
+#include "chart_validation.h"
+#include <ctime>
 #include <cassert>
 #include <cstdio>
 #include <iostream>
 #include <string>
+#include <cstdlib>
+#include <set>
+#include <map>
+#include <vector>
+#include <algorithm>
 
 using String = std::string;
 constexpr int CHART_COUNT_MAX = 5;
 constexpr int CHART_VALUE_SCALE_DEFAULT = 100;
 #include "ui_structs.inc"
 static chart_series chart_series_prop{};
+static chart_range chart_ranges[CHART_COUNT_MAX];
+static lv_obj_t *ui_group_chart[CHART_COUNT_MAX];
+static lv_chart_series_t *ui_group_chart_series[CHART_COUNT_MAX];
+static lv_obj_t *ui_cursorV;
+static constexpr uint16_t chart_point_count = 137;
+static long terminal_released_millis = 0;
+#define log_i(...) ((void)0)
+static unsigned char preview_pixels[320 * 240 * 3];
 static lv_obj_t *ui_panContainerChart;
 static lv_obj_t *ui_panSeries;
 static lv_obj_t *ui_group_legend_pan[CHART_COUNT_MAX];
 static lv_obj_t *ui_group_legend_cap[CHART_COUNT_MAX];
 static lv_obj_t *ui_group_legend_val[CHART_COUNT_MAX];
 constexpr int COLOR_SHADOW = 0;
+constexpr int COLOR_HIGHLIGHT = 0xFFFef7;
+constexpr int CHART_WIDTH_PIXEL = 274;
+static lv_obj_t *ui_panCharts;
+static lv_obj_t *ui_lblChartSpan;
+static lv_obj_t *ui_lblChartTimestamp;
+static int64_t test_epoch_base = 0;
+int64_t network_epoch_us(uint64_t us) { return test_epoch_base ? test_epoch_base + us : 0; }
 constexpr int COLOR_CHART_SERIES_NAME_TEXT = 0;
 constexpr int COLOR_CHART_SERIES_VALUE_TEXT = 0xFFFef7;
 constexpr int COLOR_TERM_RX_TEXT = 0xFFFef7;
@@ -31,7 +54,121 @@ LV_FONT_DECLARE(ui_font_SFMono_9);
 }
 
 #include "legend_helpers.inc"
+static bool is_chart = false;
+static bool panList_scroll_to_view = true;
+constexpr size_t UART_LINE_MAX_LENGTH = 2048;
+constexpr int MALLOC_CAP_SPIRAM = 1;
+constexpr int MALLOC_CAP_8BIT = 2;
+static std::set<void *> terminal_allocations;
+static void *heap_caps_malloc(size_t size, int)
+{
+    void *ptr = malloc(size);
+    if (ptr) terminal_allocations.insert(ptr);
+    return ptr;
+}
+static void terminal_free(void *ptr)
+{
+    if (ptr) assert(terminal_allocations.erase(ptr) == 1);
+    free(ptr);
+}
+static uint32_t terminal_test_ms = 0;
+static uint32_t millis() { return terminal_test_ms; }
+#define free terminal_free
 #include "terminal_helpers.inc"
+#undef free
+#include "terminal_events.inc"
+
+static std::string terminal_visible_text(lv_obj_t *label)
+{
+    assert(!lv_label_get_recolor(label));
+    return lv_label_get_text(label);
+}
+
+static std::map<std::pair<int, int>, std::pair<uint32_t, uint32_t>> drawn_hex;
+static lv_area_t capture_area;
+static void (*original_draw_letter)(lv_draw_ctx_t *, const lv_draw_label_dsc_t *, const lv_point_t *, uint32_t);
+static void capture_hex_letter(lv_draw_ctx_t *context, const lv_draw_label_dsc_t *draw,
+                               const lv_point_t *position, uint32_t letter)
+{
+    if (draw->font == &ui_font_SFMono_14 && position->x >= capture_area.x1 &&
+        position->x <= capture_area.x2 && position->y >= capture_area.y1 && position->y <= capture_area.y2)
+    {
+        const auto key = std::make_pair(int(position->y), int(position->x));
+        const auto value = std::make_pair(letter, uint32_t(draw->color.full));
+        const auto found = drawn_hex.find(key);
+        assert(found == drawn_hex.end() || found->second == value);
+        drawn_hex[key] = value;
+    }
+    original_draw_letter(context, draw, position, letter);
+}
+
+static void check_wrapped_hex_rendering()
+{
+    lv_obj_add_flag(ui_panContainerChart, LV_OBJ_FLAG_HIDDEN);
+    auto *context = lv_disp_get_default()->driver->draw_ctx;
+    original_draw_letter = context->draw_letter;
+    for (bool rx : {true, false})
+    {
+        terminal_hex = true;
+        ui_panList = lv_obj_create(lv_scr_act());
+        lv_obj_set_size(ui_panList, 80, 210);
+        lv_obj_set_pos(ui_panList, 0, 0);
+        lv_obj_set_style_pad_all(ui_panList, 0, LV_PART_MAIN);
+        lv_obj_set_style_border_width(ui_panList, 0, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(ui_panList, lv_color_black(), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(ui_panList, LV_OPA_COVER, LV_PART_MAIN);
+        const std::string sample(81, char(0xFF));
+        ui_record_terminal_line(rx, sample.data(), sample.size());
+        const std::string text = lv_label_get_text(currentLine);
+        assert(text.find('#') == std::string::npos && text.find(' ') == std::string::npos);
+        assert(std::count(text.begin(), text.end(), 'F') == 162);
+        assert(std::count(text.begin(), text.end(), '\n') > 1);
+        const auto *row = static_cast<terminal_row *>(lv_obj_get_user_data(currentLine));
+        assert(row->hex_columns > 1 && row->hex_columns < sample.size());
+        const auto *font = lv_obj_get_style_text_font(currentLine, LV_PART_MAIN);
+        const int spacing = lv_obj_get_style_text_letter_space(currentLine, LV_PART_MAIN);
+        const int glyph_width = lv_font_get_glyph_width(font, 'F', 'F');
+        const int glyph_step = glyph_width + spacing;
+        const int line_step = lv_font_get_line_height(font) + lv_obj_get_style_text_line_space(currentLine, LV_PART_MAIN);
+        for (int scroll : {0, 120})
+        {
+            lv_obj_scroll_to_y(ui_panList, scroll, LV_ANIM_OFF);
+            lv_obj_update_layout(ui_panList);
+            lv_obj_get_content_coords(currentLine, &capture_area);
+            drawn_hex.clear();
+            context->draw_letter = capture_hex_letter;
+            lv_obj_invalidate(ui_panList);
+            lv_refr_now(nullptr);
+            context->draw_letter = original_draw_letter;
+            assert(!drawn_hex.empty());
+            unsigned deepest_line = 0;
+            for (const auto &entry : drawn_hex)
+            {
+                const int y = entry.first.first, x = entry.first.second;
+                const unsigned line = (y - capture_area.y1) / line_step;
+                const unsigned first = line * row->hex_columns;
+                const unsigned bytes = std::min(unsigned(row->hex_columns), unsigned(sample.size()) - first);
+                const int line_width = 2 * bytes * glyph_step - spacing;
+                const int start_x = rx ? capture_area.x1 : capture_area.x2 - line_width + 1;
+                if ((x - start_x) % glyph_step != 0)
+                    std::cerr << "RX=" << rx << " scroll=" << scroll << " x=" << x << " start=" << start_x
+                              << " y=" << y << " line=" << line << " char=" << entry.second.first
+                              << " step=" << glyph_step << std::endl;
+                assert((x - start_x) % glyph_step == 0);
+                const unsigned nibble = (x - start_x) / glyph_step;
+                assert(nibble < bytes * 2 && entry.second.first == 'F');
+                const unsigned byte = first + nibble / 2;
+                const lv_color_t primary = lv_color_hex(rx ? COLOR_TERM_RX_TEXT : COLOR_TERM_TX_TEXT);
+                const lv_color_t alternate = lv_color_hex(rx ? 0x6AC5DB : COLOR_TERM_RX_TEXT);
+                assert(entry.second.second == uint32_t((byte % 2 == 0 ? primary : alternate).full));
+                deepest_line = std::max(deepest_line, line);
+            }
+            assert(deepest_line > 1); // Every rendered line must preserve byte parity.
+        }
+        lv_obj_del(ui_panList);
+        assert(terminal_allocations.empty());
+    }
+}
 
 static void check_terminal_history()
 {
@@ -44,7 +181,7 @@ static void check_terminal_history()
     {
         char text[32];
         snprintf(text, sizeof(text), "packet %u", i);
-        ui_record_terminal_line(i % 2 == 0, text);
+        ui_record_terminal_line(i % 2 == 0, text, strlen(text));
         assert(lv_obj_get_child_cnt(ui_panList) <= TERM_ROW_MAX_NUM);
     }
     assert(lineCount == 100);
@@ -53,19 +190,138 @@ static void check_terminal_history()
     assert(std::string(lv_label_get_text(lv_obj_get_child(ui_panList, 0))) == "packet 50");
     assert(std::string(lv_label_get_text(currentLine)) == "packet 99");
     lv_obj_add_flag(ui_panList, LV_OBJ_FLAG_HIDDEN);
-    ui_record_terminal_line(true, "received with terminal hidden");
+    ui_record_terminal_line(true, "received with terminal hidden", strlen("received with terminal hidden"));
     assert(lineCount == 101 && lv_obj_get_child_cnt(ui_panList) == TERM_ROW_MAX_NUM);
     lv_obj_clear_flag(ui_panList, LV_OBJ_FLAG_HIDDEN);
     assert(std::string(lv_label_get_text(currentLine)) == "received with terminal hidden");
+    // A format change re-renders the cached bytes even without new UART input.
+    const char bytes[] = {'A', '\0', char(0x80), char(0xFF), '\r'};
+    ui_record_terminal_line(false, bytes, sizeof(bytes));
+    assert(std::string(lv_label_get_text(currentLine)) == std::string("A.\x80\xFF", 4));
+    const uint32_t count = lineCount;
+    assert(!ui_terminal_button_event(LV_EVENT_PRESSED));
+    terminal_test_ms += 2100;
+    assert(ui_terminal_button_event(LV_EVENT_RELEASED));
+    assert(terminal_hex && lineCount == count);
+    assert(terminal_visible_text(currentLine) == "410080FF0D");
+    assert(!lv_label_get_recolor(currentLine));
+    assert(std::string(lv_label_get_text(currentLine)).find('#') == std::string::npos);
+    assert(std::string(lv_label_get_text(currentLine)).find(' ') == std::string::npos);
+    assert(!ui_terminal_button_event(LV_EVENT_RELEASED));
+    assert(terminal_hex); // duplicate release cannot toggle twice
+    ui_terminal_button_event(LV_EVENT_PRESSED);
+    terminal_test_ms += 1999;
+    assert(!ui_terminal_button_event(LV_EVENT_RELEASED));
+    assert(terminal_hex); // short press is left for the existing scroll action
+    is_chart = true;
+    ui_terminal_button_event(LV_EVENT_PRESSED);
+    terminal_test_ms += 1000;
+    assert(!ui_terminal_button_event(LV_EVENT_RELEASED));
+    assert(terminal_hex);
+    is_chart = false;
+    std::string longest(UART_LINE_MAX_LENGTH, char(0xFF));
+    longest += '\n';
+    ui_record_terminal_line(true, longest.data(), longest.size());
+    assert(terminal_visible_text(currentLine).size() < 560);
+    assert(terminal_visible_text(currentLine).find("(+1793 bytes)") != std::string::npos);
+    auto *cached = static_cast<terminal_row *>(lv_obj_get_user_data(currentLine));
+    assert(cached->length == longest.size());
+    assert(memcmp(cached->data, longest.data(), longest.size()) == 0);
+    assert(terminal_visible_text(currentLine).substr(0, 8) == "FFFFFFFF");
+    ui_toggle_terminal_format();
+    assert(!terminal_hex && lineCount == count + 1);
+    assert(strlen(lv_label_get_text(currentLine)) == UART_LINE_MAX_LENGTH);
+    assert(terminal_allocations.size() == TERM_ROW_MAX_NUM);
+    lv_obj_add_event_cb(ui_panList, ui_event_panList, LV_EVENT_ALL, nullptr);
+    panList_scroll_to_view = true;
+    const uint32_t count_before_press = lineCount;
+    lv_event_send(ui_panList, LV_EVENT_PRESSED, nullptr);
+    terminal_test_ms += 2100;
+    lv_event_send(ui_panList, LV_EVENT_RELEASED, nullptr);
+    assert(terminal_hex && panList_scroll_to_view);
+    uint32_t key = LV_KEY_ENTER;
+    lv_event_send(ui_panList, LV_EVENT_KEY, &key);
+    assert(panList_scroll_to_view); // LVGL's trailing ENTER is not a scroll request.
+    key = LV_KEY_RIGHT;
+    lv_event_send(ui_panList, LV_EVENT_KEY, &key);
+    assert(!panList_scroll_to_view);
+    lv_event_send(ui_panList, LV_EVENT_PRESSED, nullptr);
+    terminal_test_ms += 100;
+    lv_event_send(ui_panList, LV_EVENT_RELEASED, nullptr);
+    assert(panList_scroll_to_view && lineCount == count_before_press);
+    for (unsigned i = 0; i < TERM_ROW_MAX_NUM; ++i)
+        ui_record_terminal_line(true, longest.data(), longest.size());
+    lv_obj_update_layout(ui_panList);
+    assert(lv_obj_get_scroll_bottom(ui_panList) >= 0);
+    lv_area_t last_row;
+    lv_obj_get_coords(currentLine, &last_row);
+    assert(last_row.y2 < 30000); // Wrapped previews remain within LVGL's coordinate range.
+    assert(terminal_allocations.size() == TERM_ROW_MAX_NUM);
+    lv_obj_del(ui_panList);
+    assert(terminal_allocations.empty());
+    terminal_hex = false;
+    ui_panList = lv_obj_create(lv_scr_act());
+    const char *literal = "#FF0000 literal#";
+    ui_record_terminal_line(true, literal, strlen(literal));
+    assert(!lv_label_get_recolor(currentLine));
+    assert(terminal_visible_text(currentLine) == literal);
+    ui_toggle_terminal_format();
+    assert(!lv_label_get_recolor(currentLine));
+    assert(terminal_visible_text(currentLine).substr(0, 4) == "2346");
+    ui_toggle_terminal_format();
+    assert(!lv_label_get_recolor(currentLine) && terminal_visible_text(currentLine) == literal);
+    lv_obj_clean(ui_panList);
+    lv_obj_set_size(ui_panList, 320, 80);
+    lv_obj_set_pos(ui_panList, 0, 0);
+    lv_obj_set_style_pad_all(ui_panList, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(ui_panList, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(ui_panList, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(ui_panList, LV_OPA_COVER, LV_PART_MAIN);
+    terminal_hex = true;
+    const std::string sample(16, char(0xFF));
+    ui_record_terminal_line(true, sample.data(), sample.size());
+    lv_obj_update_layout(ui_panList);
+    lv_refr_now(nullptr);
+    lv_area_t area;
+    lv_obj_get_coords(currentLine, &area);
+    unsigned found_primary = 0, found_alternate = 0;
+    const uint32_t primary = lv_color_to32(lv_color_hex(COLOR_TERM_RX_TEXT)) & 0xFFFFFF;
+    const uint32_t alternate = lv_color_to32(lv_color_hex(0x6AC5DB)) & 0xFFFFFF;
+    for (int y = area.y1; y <= area.y2 && y < 240; ++y)
+        for (int x = area.x1; x <= area.x2 && x < 320; ++x)
+        {
+            if (x < 0 || y < 0) continue;
+            const auto *pixel = preview_pixels + (y * 320 + x) * 3;
+            const uint32_t rgb = (uint32_t(pixel[0]) << 16) | (uint32_t(pixel[1]) << 8) | pixel[2];
+            found_primary += rgb == primary;
+            found_alternate += rgb == alternate;
+        }
+    assert(found_primary > 0 && found_alternate > 0);
+    lv_obj_del(ui_panList);
+    assert(terminal_allocations.empty());
+
 }
 
 static void create_actual_legend()
 {
+    ui_panCharts = lv_obj_create(ui_panContainerChart);
+    lv_obj_set_size(ui_panCharts, 300, 150);
+    lv_obj_set_style_pad_all(ui_panCharts, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(ui_panCharts, 0, LV_PART_MAIN);
 #include "legend_creation.inc"
 }
 
-static void flush(lv_disp_drv_t *driver, const lv_area_t *, lv_color_t *)
+static void flush(lv_disp_drv_t *driver, const lv_area_t *area, lv_color_t *colors)
 {
+    for (int y = area->y1; y <= area->y2; ++y)
+        for (int x = area->x1; x <= area->x2; ++x)
+        {
+            const uint32_t color = lv_color_to32(*colors++);
+            const size_t pos = (y * 320 + x) * 3;
+            preview_pixels[pos] = color >> 16;
+            preview_pixels[pos + 1] = color >> 8;
+            preview_pixels[pos + 2] = color;
+        }
     lv_disp_flush_ready(driver);
 }
 
@@ -160,6 +416,8 @@ int main()
     assert_fits(0, "--");
     assert_uniform_layout(5);
     check_terminal_history();
+    check_wrapped_hex_rendering();
     std::cout << "PASS: real LVGL layout, uniform row fonts, centered columns, 1-5 channels, negative signs and wide-number fallback\n";
-    std::cout << "PASS: terminal history continues while hidden, keeps newest 50 records and counts each line once\n";
+    std::cout << "PASS: plain HEX bytes, direct alternating colors across wrapped/scrolled RX/TX lines, no markup glyphs\n";
+    std::cout << "PASS: terminal history, ASCII/HEX cached redraw, long/short press separation, 2048-byte rows, bounded preview and row cleanup\n";
 }

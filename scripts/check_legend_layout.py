@@ -27,6 +27,7 @@ def main():
     temp.mkdir(parents=True, exist_ok=True)
     write_changed(temp / "ui_structs.inc", section(source, "struct chart_range\n", "static struct chart_range chart_ranges"))
     write_changed(temp / "legend_helpers.inc", section(source, "static char ui_legend_value_text[", "static void ui_update_chart_range("))
+    write_changed(temp / "terminal_events.inc", section(source, "static void ui_event_panList(", "static void lv_my_disp_flush("))
     write_changed(temp / "terminal_helpers.inc", section(source, "static void ui_term_new_line(bool", "static void ui_star_shoot("))
     write_changed(temp / "legend_creation.inc", section(source, "    ui_panSeries = lv_obj_create(", "    ui_panWaiting = lv_obj_create("))
     write_changed(temp / "esp_timer.h", "#pragma once\n#include <stdint.h>\nstatic inline int64_t esp_timer_get_time(void) { return 0; }\n")
@@ -36,12 +37,15 @@ project(legend_check LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 file(GLOB_RECURSE LVGL_SOURCES "{lvgl}/src/*.c")
 add_library(lvgl_host STATIC ${{LVGL_SOURCES}})
-target_include_directories(lvgl_host PUBLIC "{lvgl}" "{ROOT}/others" "{temp}")
+target_include_directories(lvgl_host PUBLIC "{lvgl}" "{ROOT}/others" "{ROOT}/include" "{temp}" "{ROOT}/.pio/libdeps/esp32s3dev_n8r2/ArduinoJson/src")
 target_compile_definitions(lvgl_host PUBLIC LV_CONF_INCLUDE_SIMPLE LV_LVGL_H_INCLUDE_SIMPLE)
+target_compile_options(lvgl_host PRIVATE -fsanitize=address -fno-omit-frame-pointer)
 add_executable(legend_check "{ROOT}/tests/host_legend.cpp"
 "{ROOT}/src/fonts/ui_font_SFMono_23.c"
 "{ROOT}/src/fonts/ui_font_SFMono_14.c"
 "{ROOT}/src/fonts/ui_font_SFMono_9.c")
+target_compile_options(legend_check PRIVATE -fsanitize=address -fno-omit-frame-pointer)
+target_link_options(legend_check PRIVATE -fsanitize=address)
 target_link_libraries(legend_check PRIVATE lvgl_host m)
 ''')
     log = temp / "build.log"
